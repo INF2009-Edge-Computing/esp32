@@ -14,5 +14,5 @@
     "--compile-commands-dir=c:\\Users\\denny\\scan\\build"
   ],
   "idf.flashType": "JTAG",
-  "idf.portWin": "COM8"
+  "idf.portWin": "COM6"
 }

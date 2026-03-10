@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "rom/ets_sys.h"
+#include "cJSON.h"  // JSON parsing for threshold updates
 
 #define ESP32_ID RACK_1
 
@@ -22,14 +23,15 @@
 #define ESP32_COLLECT_TOPIC "/commands/" XSTR(ESP32_ID) "/collect"
 #define ESP32_DOWNLOAD_TOPIC "/commands/" XSTR(ESP32_ID) "/update_model"
 #define ESP32_STATUS_TOPIC "/sensors/" XSTR(ESP32_ID) "/status"
+#define ESP32_THRESHOLD_TOPIC "/commands/" XSTR(ESP32_ID) "/thresholds"
 
 // Set your WiFi credentials here
 #define WIFI_SSID "<WIFI_NAME>"
-#define WIFI_PASS "<WIFI_PASSWORD>"
+#define WIFI_PASS  "<WIFI_PASSWORD>"
 
 // Set your Pi 5 IP address here
-#define MQTT_BROKER_URI "mqtt://192.168.1.9:1883"
-#define HTTP_UPLOAD_URI "http://192.168.1.9:5000/upload_data"
+#define MQTT_BROKER_URI "mqtt://192.168.0.22:1883"
+#define HTTP_UPLOAD_URI "http://192.168.0.22:5000/upload_data"
 #define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
@@ -37,12 +39,15 @@
 #define MAX_UPPER 60
 #define DC_NULL 32
 #define NUM_SUBCARRIERS 64
-#define EXPECTED_PERIOD_US 100000 // 10Hz expected period between packets
+#define EXPECTED_PERIOD_US 100000 // 100ms gate (10Hz)
+
+// number of subcarriers we actually process (upper-lower+1 minus the DC)
+#define ACTIVE_SUBCARRIERS (MAX_UPPER - MAX_LOWER)
 static int64_t last_trigger_us = 0; //Last time we accepted a packet for processing
 
 #define SAMPLE_SIZE 200                                 // 20 seconds of data at 10Hz
 #define SUB_BATCH_SIZE 40                               // How many packets of data store before sending to the server (to avoid large memory spikes)
-uint8_t csi_buffer[SUB_BATCH_SIZE][MAX_UPPER - MAX_LOWER - 1]; // Store only amplitudes
+uint8_t csi_buffer[SUB_BATCH_SIZE][ACTIVE_SUBCARRIERS]; // Store only amplitudes
 u_int8_t packet_idx = 0;
 u_int8_t sub_batch_idx = 0;
 static bool is_collecting = false;
@@ -50,10 +55,71 @@ static char collection_label[12] = "unknown";
 static uint8_t dynamic_target_mac[6];
 static bool is_mac_locked = false;
 
+// track current calibration session (sent by dashboard)
+static char current_session_id[32] = "";
+
 static const char *TAG = "logger";
 static esp_mqtt_client_handle_t global_client = NULL;
+// client handle that will be filled on connect and used by helper functions
+static esp_mqtt_client_handle_t mqtt_client = NULL;
 float baseline_amp[NUM_SUBCARRIERS] = {0};
 bool wifi_connected = false;
+
+// optional thresholds sent from dashboard; may be used by inference logic
+static float current_thresholds[NUM_SUBCARRIERS] = {0};
+
+// helper to publish with a few retries & exponential backoff
+static bool publish_with_retry(const char *topic, const char *payload, int qos)
+{
+    const int max_attempts = 5;
+    int attempt = 0;
+    while (attempt < max_attempts) {
+        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, qos, 0);
+        if (msg_id >= 0) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100 * (1 << attempt))); // 100ms,200ms,400ms...
+        attempt++;
+    }
+    ESP_LOGW(TAG, "publish_with_retry failed topic=%s payload=%s", topic, payload);
+    return false;
+}
+
+// parse JSON array of numbers and store in thresholds
+static void _apply_thresholds(const char *msg)
+{
+    cJSON *root = cJSON_Parse(msg);
+    if (!root) {
+        ESP_LOGE(TAG, "failed to parse threshold JSON");
+        return;
+    }
+    if (cJSON_IsObject(root)) {
+        // look for known keys
+        cJSON *j;
+        if ((j = cJSON_GetObjectItem(root, "door_open")) && cJSON_IsNumber(j)) {
+            current_thresholds[0] = (float)j->valuedouble;
+        }
+        if ((j = cJSON_GetObjectItem(root, "door_close")) && cJSON_IsNumber(j)) {
+            current_thresholds[1] = (float)j->valuedouble;
+        }
+        if ((j = cJSON_GetObjectItem(root, "human")) && cJSON_IsNumber(j)) {
+            current_thresholds[2] = (float)j->valuedouble;
+        }
+        ESP_LOGI(TAG, "Applied thresholds from object");
+    } else if (cJSON_IsArray(root)) {
+        int idx = 0;
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, root) {
+            if (cJSON_IsNumber(item) && idx < NUM_SUBCARRIERS) {
+                current_thresholds[idx++] = (float)item->valuedouble;
+            }
+        }
+        ESP_LOGI(TAG, "Applied %d threshold values from array", idx);
+    } else {
+        ESP_LOGE(TAG, "threshold payload is neither object nor array");
+    }
+    cJSON_Delete(root);
+}
 
 typedef struct {
     char *label;
@@ -62,7 +128,6 @@ typedef struct {
 } http_task_params_t;
 
 esp_http_client_handle_t client;
-esp_mqtt_client_handle_t mqtt_client;
 void send_batch_http_task(void *pvParameters)
 {
     if(pvParameters == NULL || mqtt_client == NULL) {
@@ -87,6 +152,10 @@ void send_batch_http_task(void *pvParameters)
     esp_http_client_set_header(client, "X-Room-State", params->label);
     // Also include ESP32 ID for server-side identification of data source
     esp_http_client_set_header(client, "X-ESP32-ID", XSTR(ESP32_ID));
+    // propagate session identifier so server can isolate concurrent runs
+    if (current_session_id[0] != '\0') {
+        esp_http_client_set_header(client, "X-Session-ID", current_session_id);
+    }
     
     // Progress tracking headers for server-side assembly of batches
     char sub_batch_str[6];
@@ -115,6 +184,28 @@ void send_batch_http_task(void *pvParameters)
         ESP_LOGI(TAG, "Batch uploaded successfully (%d/%d)", params->sub_batch_idx + 1, params->total_sub_batches);
         ESP_LOGW("MEM_STATS", "HTTP Call Stats: Used %lu bytes (Peak used %lu bytes during call)", 
                  (unsigned long)(heap_before - heap_after), (unsigned long)(min_heap_before - min_heap_after));
+        // send progress event
+        char progress[128];
+        snprintf(progress, sizeof(progress), "{\"event\":\"upload\",\"sub\":%d,\"total\":%d}",
+                 params->sub_batch_idx + 1, params->total_sub_batches);
+        publish_with_retry(ESP32_STATUS_TOPIC, progress, 1);
+    } else {
+        ESP_LOGE(TAG, "HTTP upload failed (err=%d) for sub-batch %d", err, params->sub_batch_idx + 1);
+        char failmsg[128];
+        snprintf(failmsg, sizeof(failmsg), "{\"event\":\"upload_failed\",\"sub\":%d,\"err\":%d}",
+                 params->sub_batch_idx + 1, err);
+        publish_with_retry(ESP32_STATUS_TOPIC, failmsg, 1);
+        // simple retry strategy
+        int retries = 0;
+        while (retries < 3 && err != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500 * (retries + 1)));
+            err = esp_http_client_perform(client);
+            retries++;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Final upload failure after retries, aborting collection");
+            is_collecting = false;
+        }
     }
     
     // If this was the last sub-batch, clean up the HTTP client to free memory and notify server
@@ -122,10 +213,18 @@ void send_batch_http_task(void *pvParameters)
         esp_http_client_cleanup(client);
         client = NULL;
 
-        char payload[64];
-        snprintf(payload, sizeof(payload), "{\"event\": \"collection_complete\", \"label\": \"%s\"}",
-                 params->label);
-        esp_mqtt_client_publish(mqtt_client, ESP32_STATUS_TOPIC, payload, 0, 1, 0);
+        // build JSON safely so the label string is properly escaped
+        cJSON *msg_obj = cJSON_CreateObject();
+        if (msg_obj) {
+            cJSON_AddStringToObject(msg_obj, "event", "collection_complete");
+            cJSON_AddStringToObject(msg_obj, "label", params->label);
+            char *json_str = cJSON_PrintUnformatted(msg_obj);
+            if (json_str) {
+                publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+                free(json_str);
+            }
+            cJSON_Delete(msg_obj);
+        }
         ESP_LOGI(TAG, "Free Heap: %" PRIu32 " bytes", esp_get_free_heap_size());
     }
 
@@ -140,19 +239,28 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     if(wifi_connected == false || info == NULL)
         return;
 
-    if (memcmp(info->mac, dynamic_target_mac, 6) != 0)
-        return;  // ignore non-router packets
+#ifndef CSI_DEBUG
+    // During calibration, accept all real packets on-channel to increase
+    // sampling frequency without generating synthetic traffic.
+    if (!is_collecting && memcmp(info->mac, dynamic_target_mac, 6) != 0)
+        return;  // idle mode: keep only router packets
+#endif
     
     int64_t now = esp_timer_get_time();
     int64_t dt = now - last_trigger_us;
 
-    // Only accept one packet per MIN_INTERVAL_US
-    if (dt < EXPECTED_PERIOD_US)
-        return; // too soon, ignore duplicates
+    // Only accept one packet per MIN_INTERVAL_US 
+    if (dt < EXPECTED_PERIOD_US) {
+        // ESP_LOGD(TAG, "Skipping duplicate packet (dt=%lld)", dt);
+        return;
+    }
 
     // Filter out outlier packets for consistent CSI data
-    if (info->rx_ctrl.sig_len > 32 || info->rx_ctrl.rssi < -75 || info->rx_ctrl.rx_state != 0) 
+#ifndef CSI_DEBUG
+    // relax RSSI threshold to -100 so weak packets are kept
+    if (info->rx_ctrl.sig_len > 32 || info->rx_ctrl.rssi < -100 || info->rx_ctrl.rx_state != 0) 
         return;
+#endif
 
     last_trigger_us = now; // update AFTER deciding to accept
 
@@ -185,9 +293,12 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     }
            
     float avg_amp = sum_pwr / valid_sc_count;
+#ifdef CSI_DEBUG
+    ESP_LOGD(TAG, "valid_sc_count=%d avg_amp=%.2f rssi=%d sig_len=%d", valid_sc_count, avg_amp, info->rx_ctrl.rssi, info->rx_ctrl.sig_len);
+#endif
 
     // Normalization Pass 2: Create the 'Feature Vector'
-    uint8_t normalized_row[MAX_UPPER - MAX_LOWER - 1];
+    uint8_t normalized_row[ACTIVE_SUBCARRIERS];
     // Fixed-point normalization:
     // Result = (pwr * 100) / avg
     // To avoid division in a loop, calculate a "multiplier"
@@ -202,8 +313,10 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         normalized_row[i] = (uint8_t)(normalized > 255 ? 255 : normalized);
     }
 
-    // log normalized row for debugging
+    // log normalized row for debugging (enable with CSI_DEBUG compile flag)
+#ifdef CSI_DEBUG
     ESP_LOGI(TAG, "CSI Packet: Avg Amp=%.2f", avg_amp);
+#endif
 
     // --- PATH A: INFERENCE (Always Active) ---
     /* This is where you will eventually call:
@@ -214,7 +327,7 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     if (is_collecting)
     {
         // Copy the normalized row into the global BATCH buffer
-        if (sub_batch_idx < SUB_BATCH_SIZE)
+        if (packet_idx < SUB_BATCH_SIZE)
         {
             memcpy(csi_buffer[packet_idx], normalized_row, sizeof(normalized_row));
             packet_idx++;
@@ -268,24 +381,68 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Subscribe to multiple topics
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 0);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 0);
-        mqtt_client = event->client; // Store the client handle for use in the CSI callback
+        esp_mqtt_client_subscribe(event->client, ESP32_THRESHOLD_TOPIC, 0);
+        mqtt_client = event->client; // Store the client handle for use in callbacks
+        // publish the current thresholds so dashboard can sync
+        {
+            cJSON *outer = cJSON_CreateObject();
+            cJSON_AddStringToObject(outer, "event", "thresholds");
+            cJSON *arr = cJSON_CreateArray();
+            for (int i=0;i<NUM_SUBCARRIERS;i++) cJSON_AddItemToArray(arr, cJSON_CreateNumber(current_thresholds[i]));
+            cJSON_AddItemToObject(outer, "values", arr);
+            char *str = cJSON_PrintUnformatted(outer);
+            if (str) {
+                esp_mqtt_client_publish(mqtt_client, ESP32_STATUS_TOPIC, str, 0, 1, 0);
+                free(str);
+            }
+            cJSON_Delete(outer);
+        }
         break;
     case MQTT_EVENT_DATA:
         ESP_LOGI(TAG, "Received data on topic: %.*s", event->topic_len, event->topic);
 
         if (strncmp(event->topic, ESP32_COLLECT_TOPIC, event->topic_len) == 0)
         {
-            // Payload could be the label, e.g., "empty" or "occupied"
-            snprintf(collection_label, sizeof(collection_label), "%.*s", event->data_len, event->data);
+            // payload may be JSON {"label":"...","session":"..."} or plain string
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
+            collection_label[0] = '\0';
+            current_session_id[0] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root && cJSON_IsObject(root)) {
+                cJSON *jlabel = cJSON_GetObjectItem(root, "label");
+                if (cJSON_IsString(jlabel)) {
+                    snprintf(collection_label, sizeof(collection_label), "%s", jlabel->valuestring);
+                }
+                cJSON *jsess = cJSON_GetObjectItem(root, "session");
+                if (cJSON_IsString(jsess)) {
+                    snprintf(current_session_id, sizeof(current_session_id), "%s", jsess->valuestring);
+                }
+            }
+            cJSON_Delete(root);
+            if (!collection_label[0]) {
+                // fallback to raw payload
+                snprintf(collection_label, sizeof(collection_label), "%.*s", event->data_len, event->data);
+            }
+            if (!current_session_id[0]) {
+                // generate simple timestamp-based session id
+                int64_t t = esp_timer_get_time();
+                snprintf(current_session_id, sizeof(current_session_id), "%lld", t);
+            }
 
             packet_idx = 0;       // Reset buffer position
             sub_batch_idx = 0;   // Reset sub-batch position
             is_collecting = true; // Start the data collection engine
-            ESP_LOGI(TAG, "Starting data collection for state: %s", collection_label);
+            ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)", collection_label, current_session_id);
         } else if (strncmp(event->topic, ESP32_DOWNLOAD_TOPIC, event->topic_len) == 0)
         {
             // do your model download stuff here
             ESP_LOGI(TAG, "Model download requested!");
+        } else if (strncmp(event->topic, ESP32_THRESHOLD_TOPIC, event->topic_len) == 0)
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
+            _apply_thresholds(buf);
         }
         break;
     default:
