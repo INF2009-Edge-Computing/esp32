@@ -105,8 +105,8 @@ Open `main/receiver.c` and update these values:
 
 - `WIFI_SSID`
 - `WIFI_PASS`
-- `MQTT_BROKER_URI` → Pi IP, e.g. `mqtt://192.168.1.9:1883`
-- `HTTP_UPLOAD_URI` → Pi IP, e.g. `http://192.168.1.9:5000/upload_data`
+- `MQTT_BROKER_URI` → Pi IP, e.g. `mqtt://10.198.7.22:1883`
+- `HTTP_UPLOAD_URI` → Pi IP, e.g. `http://10.198.7.22:5000/upload_data`
 
 Also note:
 
@@ -267,8 +267,8 @@ correct.
 
 ## Current defaults in repository
 
-- MQTT broker URI in firmware: `mqtt://192.168.1.9:1883`
-- HTTP upload URI in firmware: `http://192.168.1.9:5000/upload_data`
+- MQTT broker URI in firmware: `mqtt://10.198.7.22:1883`
+- HTTP upload URI in firmware: `http://10.198.7.22:5000/upload_data`
 - Trigger script broker default: `localhost`
 
 Adjust these values to your environment before running.

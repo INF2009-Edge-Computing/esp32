@@ -1,9 +1,14 @@
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_event.h"
+#include "esp_system.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "regex.h"
 #include "mqtt_client.h"
@@ -14,7 +19,7 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "rom/ets_sys.h"
-#include "cJSON.h"  // JSON parsing for threshold updates
+#include "cJSON.h"  // JSON parsing helper
 
 #define ESP32_ID RACK_1
 
@@ -22,16 +27,19 @@
 #define XSTR(x) STR(x)
 #define ESP32_COLLECT_TOPIC "/commands/" XSTR(ESP32_ID) "/collect"
 #define ESP32_DOWNLOAD_TOPIC "/commands/" XSTR(ESP32_ID) "/update_model"
+#define ESP32_ASSIGN_TOPIC "/commands/" XSTR(ESP32_ID) "/assign_name"
 #define ESP32_STATUS_TOPIC "/sensors/" XSTR(ESP32_ID) "/status"
-#define ESP32_THRESHOLD_TOPIC "/commands/" XSTR(ESP32_ID) "/thresholds"
 
 // Set your WiFi credentials here
-#define WIFI_SSID "<WIFI_NAME>"
-#define WIFI_PASS  "<WIFI_PASSWORD>"
+#define WIFI_SSID "YourSSID"
+#define WIFI_PASS  "password123"
 
 // Set your Pi 5 IP address here
-#define MQTT_BROKER_URI "mqtt://192.168.0.22:1883"
-#define HTTP_UPLOAD_URI "http://192.168.0.22:5000/upload_data"
+#define MQTT_BROKER_URI "mqtt://10.198.7.22:1883"
+#define HTTP_UPLOAD_URI "http://10.198.7.22:5000/upload_data"
+#define HTTP_SERVER_BASE "http://10.198.7.22:5000"
+#define HTTP_MODEL_URI HTTP_SERVER_BASE "/model/" XSTR(ESP32_ID)
+#define HTTP_PARAMS_URI HTTP_SERVER_BASE "/params/" XSTR(ESP32_ID)
 #define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
@@ -65,8 +73,259 @@ static esp_mqtt_client_handle_t mqtt_client = NULL;
 float baseline_amp[NUM_SUBCARRIERS] = {0};
 bool wifi_connected = false;
 
-// optional thresholds sent from dashboard; may be used by inference logic
-static float current_thresholds[NUM_SUBCARRIERS] = {0};
+static uint8_t *model_buffer = NULL;
+static size_t model_size = 0;
+static bool model_ready = false;
+static float mean_vals[ACTIVE_SUBCARRIERS] = {0};
+static float std_vals[ACTIVE_SUBCARRIERS] = {0};
+static int pred_history[10] = {0};
+static int pred_history_idx = 0;
+static int pred_history_count = 0;
+static int current_majority_state = -1;
+
+// forward declaration
+static bool publish_with_retry(const char *topic, const char *payload, int qos);
+
+static void publish_ack(const char *cmd)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+    cJSON_AddStringToObject(obj, "event", "ack");
+    cJSON_AddStringToObject(obj, "cmd", cmd);
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
+}
+
+static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_len)
+{
+    *out_buf = NULL;
+    *out_len = 0;
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 8000,
+    };
+    esp_http_client_handle_t h = esp_http_client_init(&config);
+    if (!h) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(h);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(h);
+        return err;
+    }
+
+    int status = esp_http_client_get_status_code(h);
+    if (status < 200 || status >= 300) {
+        esp_http_client_cleanup(h);
+        return ESP_FAIL;
+    }
+
+    int content_len = esp_http_client_get_content_length(h);
+    int alloc_len = (content_len > 0 && content_len < (1024 * 1024)) ? (content_len + 1) : (64 * 1024);
+    uint8_t *buf = (uint8_t *)malloc(alloc_len);
+    if (!buf) {
+        esp_http_client_cleanup(h);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int read_len = esp_http_client_read_response(h, (char *)buf, alloc_len - 1);
+    if (read_len <= 0) {
+        free(buf);
+        esp_http_client_cleanup(h);
+        return ESP_FAIL;
+    }
+    buf[read_len] = '\0';
+
+    *out_buf = buf;
+    *out_len = read_len;
+    esp_http_client_cleanup(h);
+    return ESP_OK;
+}
+
+static bool load_scaler_params(const uint8_t *json_buf, int json_len)
+{
+    cJSON *root = cJSON_ParseWithLength((const char *)json_buf, json_len);
+    if (!root) {
+        return false;
+    }
+    cJSON *mean_arr = cJSON_GetObjectItem(root, "mean");
+    cJSON *std_arr = cJSON_GetObjectItem(root, "std");
+    if (!cJSON_IsArray(mean_arr) || !cJSON_IsArray(std_arr)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+        mean_vals[i] = 0.0f;
+        std_vals[i] = 1.0f;
+    }
+
+    int mean_sz = cJSON_GetArraySize(mean_arr);
+    int std_sz = cJSON_GetArraySize(std_arr);
+    int lim = mean_sz < std_sz ? mean_sz : std_sz;
+    if (lim > ACTIVE_SUBCARRIERS) {
+        lim = ACTIVE_SUBCARRIERS;
+    }
+
+    for (int i = 0; i < lim; i++) {
+        cJSON *jm = cJSON_GetArrayItem(mean_arr, i);
+        cJSON *js = cJSON_GetArrayItem(std_arr, i);
+        if (cJSON_IsNumber(jm)) {
+            mean_vals[i] = (float)jm->valuedouble;
+        }
+        if (cJSON_IsNumber(js) && js->valuedouble != 0.0) {
+            std_vals[i] = (float)js->valuedouble;
+        }
+    }
+
+    cJSON_Delete(root);
+    return true;
+}
+
+static int run_model(const float *input, size_t len)
+{
+    if (!model_ready || !input || len == 0) {
+        return -1;
+    }
+
+    // Placeholder inference until TFLM is integrated.
+    float avg = 0.0f;
+    for (size_t i = 0; i < len; i++) {
+        avg += input[i];
+    }
+    avg /= (float)len;
+
+    if (avg < -0.3f) {
+        return 0; // door_closed
+    }
+    if (avg > 0.7f) {
+        return 1; // door_open
+    }
+    return 2; // person_standing
+}
+
+static void update_majority_and_notify(int pred)
+{
+    if (pred < 0 || pred > 2) {
+        return;
+    }
+
+    pred_history[pred_history_idx] = pred;
+    pred_history_idx = (pred_history_idx + 1) % 10;
+    if (pred_history_count < 10) {
+        pred_history_count++;
+    }
+
+    if (pred_history_count < 10) {
+        return; // wait until the 10-sample window is full
+    }
+
+    int counts[3] = {0, 0, 0};
+    for (int i = 0; i < 10; i++) {
+        int v = pred_history[i];
+        if (v >= 0 && v <= 2) {
+            counts[v]++;
+        }
+    }
+
+    int maj = 0;
+    if (counts[1] > counts[maj]) {
+        maj = 1;
+    }
+    if (counts[2] > counts[maj]) {
+        maj = 2;
+    }
+
+    if (maj == current_majority_state) {
+        return;
+    }
+
+    const char *states[3] = {"door_closed", "door_open", "person_standing"};
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+    cJSON_AddStringToObject(obj, "event", "state_change");
+    cJSON_AddStringToObject(obj, "state", states[maj]);
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
+    current_majority_state = maj;
+}
+
+static void download_model_and_params_task(void *pvParameters)
+{
+    (void)pvParameters;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        uint8_t *downloaded_model = NULL;
+        uint8_t *downloaded_params = NULL;
+        int model_len = 0;
+        int params_len = 0;
+
+        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len);
+        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len);
+
+        if (e1 == ESP_OK && e2 == ESP_OK && load_scaler_params(downloaded_params, params_len)) {
+            if (model_buffer) {
+                free(model_buffer);
+            }
+            model_buffer = downloaded_model;
+            model_size = (size_t)model_len;
+            model_ready = true;
+            free(downloaded_params);
+
+            cJSON *obj = cJSON_CreateObject();
+            if (obj) {
+                cJSON_AddStringToObject(obj, "event", "model_ready");
+                cJSON_AddNumberToObject(obj, "bytes", (double)model_size);
+                char *json_str = cJSON_PrintUnformatted(obj);
+                if (json_str) {
+                    publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+                    free(json_str);
+                }
+                cJSON_Delete(obj);
+            }
+
+            ESP_LOGI(TAG, "Model/scaler download successful, bytes=%d", model_len);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        if (downloaded_model) {
+            free(downloaded_model);
+        }
+        if (downloaded_params) {
+            free(downloaded_params);
+        }
+
+        ESP_LOGW(TAG, "Model/scaler download attempt %d/3 failed", attempt);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    if (obj) {
+        cJSON_AddStringToObject(obj, "event", "model_download_failed");
+        char *json_str = cJSON_PrintUnformatted(obj);
+        if (json_str) {
+            publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+            free(json_str);
+        }
+        cJSON_Delete(obj);
+    }
+    vTaskDelete(NULL);
+}
 
 // helper to publish with a few retries & exponential backoff
 static bool publish_with_retry(const char *topic, const char *payload, int qos)
@@ -85,41 +344,6 @@ static bool publish_with_retry(const char *topic, const char *payload, int qos)
     return false;
 }
 
-// parse JSON array of numbers and store in thresholds
-static void _apply_thresholds(const char *msg)
-{
-    cJSON *root = cJSON_Parse(msg);
-    if (!root) {
-        ESP_LOGE(TAG, "failed to parse threshold JSON");
-        return;
-    }
-    if (cJSON_IsObject(root)) {
-        // look for known keys
-        cJSON *j;
-        if ((j = cJSON_GetObjectItem(root, "door_open")) && cJSON_IsNumber(j)) {
-            current_thresholds[0] = (float)j->valuedouble;
-        }
-        if ((j = cJSON_GetObjectItem(root, "door_close")) && cJSON_IsNumber(j)) {
-            current_thresholds[1] = (float)j->valuedouble;
-        }
-        if ((j = cJSON_GetObjectItem(root, "human")) && cJSON_IsNumber(j)) {
-            current_thresholds[2] = (float)j->valuedouble;
-        }
-        ESP_LOGI(TAG, "Applied thresholds from object");
-    } else if (cJSON_IsArray(root)) {
-        int idx = 0;
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, root) {
-            if (cJSON_IsNumber(item) && idx < NUM_SUBCARRIERS) {
-                current_thresholds[idx++] = (float)item->valuedouble;
-            }
-        }
-        ESP_LOGI(TAG, "Applied %d threshold values from array", idx);
-    } else {
-        ESP_LOGE(TAG, "threshold payload is neither object nor array");
-    }
-    cJSON_Delete(root);
-}
 
 typedef struct {
     char *label;
@@ -319,9 +543,17 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
     // --- PATH A: INFERENCE (Always Active) ---
-    /* This is where you will eventually call:
-       your_tflite_model_run(normalized_row);
-    */
+    float model_input[ACTIVE_SUBCARRIERS] = {0};
+    for (u_int8_t i = 0; i < valid_sc_count && i < ACTIVE_SUBCARRIERS; i++)
+    {
+        float sigma = std_vals[i];
+        if (sigma == 0.0f) {
+            sigma = 1.0f;
+        }
+        model_input[i] = (((float)normalized_row[i]) - mean_vals[i]) / sigma;
+    }
+    int pred = run_model(model_input, valid_sc_count);
+    update_majority_and_notify(pred);
 
     // --- PATH B: DATA COLLECTION (Gated by MQTT) ---
     if (is_collecting)
@@ -381,20 +613,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Subscribe to multiple topics
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 0);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 0);
-        esp_mqtt_client_subscribe(event->client, ESP32_THRESHOLD_TOPIC, 0);
+        esp_mqtt_client_subscribe(event->client, ESP32_ASSIGN_TOPIC, 0);
         mqtt_client = event->client; // Store the client handle for use in callbacks
-        // publish the current thresholds so dashboard can sync
-        {
-            cJSON *outer = cJSON_CreateObject();
-            cJSON_AddStringToObject(outer, "event", "thresholds");
-            cJSON *arr = cJSON_CreateArray();
-            for (int i=0;i<NUM_SUBCARRIERS;i++) cJSON_AddItemToArray(arr, cJSON_CreateNumber(current_thresholds[i]));
-            cJSON_AddItemToObject(outer, "values", arr);
-            char *str = cJSON_PrintUnformatted(outer);
-            if (str) {
-                esp_mqtt_client_publish(mqtt_client, ESP32_STATUS_TOPIC, str, 0, 1, 0);
-                free(str);
-            }
             cJSON_Delete(outer);
         }
         break;
@@ -403,6 +623,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         if (strncmp(event->topic, ESP32_COLLECT_TOPIC, event->topic_len) == 0)
         {
+            publish_ack("start_calibration");
             // payload may be JSON {"label":"...","session":"..."} or plain string
             char buf[256];
             snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
@@ -436,14 +657,52 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)", collection_label, current_session_id);
         } else if (strncmp(event->topic, ESP32_DOWNLOAD_TOPIC, event->topic_len) == 0)
         {
-            // do your model download stuff here
+            publish_ack("update_model");
             ESP_LOGI(TAG, "Model download requested!");
-        } else if (strncmp(event->topic, ESP32_THRESHOLD_TOPIC, event->topic_len) == 0)
+            if (xTaskCreate(download_model_and_params_task,
+                            "model_dl",
+                            8192,
+                            NULL,
+                            5,
+                            NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Failed to start model download task");
+            }
+        } else if (strncmp(event->topic, ESP32_ASSIGN_TOPIC, event->topic_len) == 0)
         {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
-            _apply_thresholds(buf);
-        }
+            publish_ack("assign_name");
+            char payload_buf[128];
+            snprintf(payload_buf, sizeof(payload_buf), "%.*s", event->data_len, event->data);
+
+            cJSON *root = cJSON_Parse(payload_buf);
+            const char *new_name = payload_buf;
+            if (root && cJSON_IsObject(root)) {
+                cJSON *jname = cJSON_GetObjectItem(root, "name");
+                if (cJSON_IsString(jname) && jname->valuestring && jname->valuestring[0]) {
+                    new_name = jname->valuestring;
+                }
+            }
+
+            nvs_handle_t nvs_h;
+            if (nvs_open("device_cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
+                nvs_set_str(nvs_h, "name", new_name);
+                nvs_commit(nvs_h);
+                nvs_close(nvs_h);
+            }
+
+            cJSON *obj = cJSON_CreateObject();
+            if (obj) {
+                cJSON_AddStringToObject(obj, "event", "identify_confirmed");
+                cJSON_AddStringToObject(obj, "name", new_name);
+                char *json_str = cJSON_PrintUnformatted(obj);
+                if (json_str) {
+                    publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+                    free(json_str);
+                }
+                cJSON_Delete(obj);
+            }
+            cJSON_Delete(root);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
         break;
     default:
         break;
@@ -604,6 +863,10 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
+    for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+        std_vals[i] = 1.0f;
+    }
 
     wifi_init_sta();
 
