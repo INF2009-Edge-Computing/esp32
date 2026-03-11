@@ -1,3 +1,4 @@
+extern "C" {
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -14,7 +15,16 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "rom/ets_sys.h"
-#include "cJSON.h"  // JSON parsing for threshold updates
+#include "mdns.h"
+#include "cJSON.h"
+}
+
+// TFLite Includes
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "model_data.h"
 
 #define ESP32_ID RACK_1
 
@@ -26,12 +36,13 @@
 #define ESP32_THRESHOLD_TOPIC "/commands/" XSTR(ESP32_ID) "/thresholds"
 
 // Set your WiFi credentials here
-#define WIFI_SSID "<WIFI_NAME>"
-#define WIFI_PASS  "<WIFI_PASSWORD>"
+#define WIFI_SSID "LAPTOP-4MHUFCI0"
+#define WIFI_PASS "5La43:30"
 
 // Set your Pi 5 IP address here
-#define MQTT_BROKER_URI "mqtt://192.168.0.22:1883"
-#define HTTP_UPLOAD_URI "http://192.168.0.22:5000/upload_data"
+#define MQTT_BROKER_URI "mqtt://192.168.137.106:1883"
+#define HTTP_UPLOAD_URI "http://192.168.137.106:5000/upload_data"
+#define HTTP_DOWNLOAD_URI "http://192.168.137.106:5000/static/models/" XSTR(ESP32_ID)
 #define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
@@ -50,6 +61,190 @@ static int64_t last_trigger_us = 0; //Last time we accepted a packet for process
 uint8_t csi_buffer[SUB_BATCH_SIZE][ACTIVE_SUBCARRIERS]; // Store only amplitudes
 u_int8_t packet_idx = 0;
 u_int8_t sub_batch_idx = 0;
+
+// TFLite Global Variables
+namespace {
+    const tflite::Model* model = nullptr;
+    tflite::MicroInterpreter* interpreter = nullptr;
+    TfLiteTensor* input = nullptr;
+    TfLiteTensor* output = nullptr;
+
+    const int kTensorArenaSize = 10 * 1024; // Adjust this based on your model size
+    uint8_t tensor_arena[kTensorArenaSize];
+
+    // Dynamic model storage
+    uint8_t* dynamic_model_buffer = nullptr;
+    size_t dynamic_model_size = 0;
+    bool model_update_pending = false;
+}
+
+void tflite_init(); // Forward declaration
+
+void download_model_task(void *pvParameters) {
+    char* url = (char*)pvParameters;
+    ESP_LOGI("HTTP_MODEL", "Downloading model from: %s", url);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 10000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE("HTTP_MODEL", "Failed to init client");
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE("HTTP_MODEL", "Failed to open connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) {
+        ESP_LOGE("HTTP_MODEL", "Invalid content length: %d", content_length);
+        esp_http_client_cleanup(client);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Allocate RAM for the model
+    uint8_t* buffer = (uint8_t*)malloc(content_length);
+    if (!buffer) {
+        ESP_LOGE("HTTP_MODEL", "Could not allocate %d bytes for model", content_length);
+        esp_http_client_cleanup(client);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int read_bytes = esp_http_client_read_response(client, (char*)buffer, content_length);
+    if (read_bytes != content_length) {
+        ESP_LOGE("HTTP_MODEL", "Read mismatch: %d != %d", read_bytes, content_length);
+        free(buffer);
+    } else {
+        ESP_LOGI("HTTP_MODEL", "Successfully downloaded %d bytes", read_bytes);
+        
+        // Atomic swap or flag
+        uint8_t* old_buffer = dynamic_model_buffer;
+        dynamic_model_buffer = buffer;
+        dynamic_model_size = (size_t)read_bytes;
+        model_update_pending = true;
+
+        if (old_buffer) {
+            ESP_LOGI("HTTP_MODEL", "Freeing old model buffer");
+            // Note: In a real system, ensure nothing is using old_buffer before freeing
+            // Since we'll recreate the interpreter, it's safer to wait a bit
+            vTaskDelay(pdMS_TO_TICKS(100));
+            free(old_buffer);
+        }
+    }
+
+    esp_http_client_cleanup(client);
+    free(url);
+    vTaskDelete(NULL);
+}
+
+void tflite_init() {
+    ESP_LOGI("TFLITE", "Initializing TFLite...");
+    tflite::InitializeTarget();
+
+    // Use dynamic model if available, else static
+    const unsigned char* current_model_ptr = (dynamic_model_buffer != nullptr) ? dynamic_model_buffer : model_data;
+    
+    model = tflite::GetModel(current_model_ptr);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        ESP_LOGE("TFLITE", "Model version mismatch!");
+        return;
+    }
+
+    static tflite::MicroMutableOpResolver<5> resolver;
+    resolver.AddFullyConnected();
+    resolver.AddSoftmax();
+    resolver.AddRelu(); 
+
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize);
+    
+    interpreter = &static_interpreter;
+
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        ESP_LOGE("TFLITE", "AllocateTensors() failed");
+        return;
+    }
+
+    input = interpreter->input(0);
+    output = interpreter->output(0);
+    ESP_LOGI("TFLITE", "TFLite Ready (Model: %s)", dynamic_model_buffer ? "Dynamic" : "Static");
+}
+
+void tflite_task(void *pvParameters) {
+    tflite_init();
+    while (1) {
+        if (model_update_pending) {
+            ESP_LOGI("TFLITE", "New model detected! Re-initializing...");
+            model_update_pending = false;
+            tflite_init();
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+void run_inference(uint8_t* csi_row, size_t size) {
+    if (interpreter == nullptr || input == nullptr) return;
+
+    // 1. Fill 'input' buffer with your CSI data (converting uint8_t to float)
+    for (int i = 0; i < size && i < input->dims->data[1]; i++) {
+        input->data.f[i] = (float)csi_row[i] / 100.0f; 
+    }
+
+    // 2. Run inference
+    if (interpreter->Invoke() != kTfLiteOk) {
+        ESP_LOGE("TFLITE", "Invoke failed!");
+        return;
+    }
+
+    // 3. Read 'output' results (3 classes: open, close, person)
+    float* results = output->data.f;
+    int current_pred = 0;
+    float max_val = results[0];
+    for (int i = 1; i < 3; i++) {
+        if (results[i] > max_val) {
+            max_val = results[i];
+            current_pred = i;
+        }
+    }
+
+    // --- STEADY STATE DETECTION ---
+    static int last_stable_pred = -1;
+    static int consecutive_count = 0;
+    const int STEADY_THRESHOLD = 5; // Log after 5 consecutive identical high-confidence packets
+
+    if (max_val > 0.4f) { // High confidence required
+        if (current_pred == last_stable_pred) {
+            consecutive_count++;
+        } else {
+            last_stable_pred = current_pred;
+            consecutive_count = 1;
+        }
+
+        if (consecutive_count == STEADY_THRESHOLD) {
+            const char* labels[] = {"OPEN", "CLOSE", "PERSON"};
+            ESP_LOGW("STEADY_STATE", "Confirmed State: %s (Stability: %d pkts)", 
+                     labels[current_pred], STEADY_THRESHOLD);
+            consecutive_count = 0; // Reset after logging to avoid repeated spamming
+        }
+    } else {
+        consecutive_count = 0;
+    }
+}
 static bool is_collecting = false;
 static char collection_label[12] = "unknown";
 static uint8_t dynamic_target_mac[6];
@@ -83,42 +278,6 @@ static bool publish_with_retry(const char *topic, const char *payload, int qos)
     }
     ESP_LOGW(TAG, "publish_with_retry failed topic=%s payload=%s", topic, payload);
     return false;
-}
-
-// parse JSON array of numbers and store in thresholds
-static void _apply_thresholds(const char *msg)
-{
-    cJSON *root = cJSON_Parse(msg);
-    if (!root) {
-        ESP_LOGE(TAG, "failed to parse threshold JSON");
-        return;
-    }
-    if (cJSON_IsObject(root)) {
-        // look for known keys
-        cJSON *j;
-        if ((j = cJSON_GetObjectItem(root, "door_open")) && cJSON_IsNumber(j)) {
-            current_thresholds[0] = (float)j->valuedouble;
-        }
-        if ((j = cJSON_GetObjectItem(root, "door_close")) && cJSON_IsNumber(j)) {
-            current_thresholds[1] = (float)j->valuedouble;
-        }
-        if ((j = cJSON_GetObjectItem(root, "human")) && cJSON_IsNumber(j)) {
-            current_thresholds[2] = (float)j->valuedouble;
-        }
-        ESP_LOGI(TAG, "Applied thresholds from object");
-    } else if (cJSON_IsArray(root)) {
-        int idx = 0;
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, root) {
-            if (cJSON_IsNumber(item) && idx < NUM_SUBCARRIERS) {
-                current_thresholds[idx++] = (float)item->valuedouble;
-            }
-        }
-        ESP_LOGI(TAG, "Applied %d threshold values from array", idx);
-    } else {
-        ESP_LOGE(TAG, "threshold payload is neither object nor array");
-    }
-    cJSON_Delete(root);
 }
 
 typedef struct {
@@ -313,15 +472,11 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         normalized_row[i] = (uint8_t)(normalized > 255 ? 255 : normalized);
     }
 
-    // log normalized row for debugging (enable with CSI_DEBUG compile flag)
-#ifdef CSI_DEBUG
-    ESP_LOGI(TAG, "CSI Packet: Avg Amp=%.2f", avg_amp);
-#endif
+    // log normalized row for debugging
+    // ESP_LOGI(TAG, "CSI Packet: Avg Amp=%.2f", avg_amp);
 
     // --- PATH A: INFERENCE (Always Active) ---
-    /* This is where you will eventually call:
-       your_tflite_model_run(normalized_row);
-    */
+    run_inference(normalized_row, sizeof(normalized_row));
 
     // --- PATH B: DATA COLLECTION (Gated by MQTT) ---
     if (is_collecting)
@@ -338,7 +493,7 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         {
             ESP_LOGI(TAG, "Sub-batch full (%d/%d). Triggering upload for state: %s", sub_batch_idx + 1, (SAMPLE_SIZE / SUB_BATCH_SIZE), collection_label);
 
-            http_task_params_t *params = malloc(sizeof(http_task_params_t));
+            http_task_params_t *params = (http_task_params_t *)malloc(sizeof(http_task_params_t));
             if (params != NULL) {
                 params->label = strdup(collection_label);
                 params->sub_batch_idx = sub_batch_idx;
@@ -373,7 +528,7 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id)
     {
     case MQTT_EVENT_CONNECTED:
@@ -436,13 +591,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)", collection_label, current_session_id);
         } else if (strncmp(event->topic, ESP32_DOWNLOAD_TOPIC, event->topic_len) == 0)
         {
-            // do your model download stuff here
-            ESP_LOGI(TAG, "Model download requested!");
-        } else if (strncmp(event->topic, ESP32_THRESHOLD_TOPIC, event->topic_len) == 0)
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
-            _apply_thresholds(buf);
+            // The download URL is now hardcoded. Just strdup the macro for the task.
+            char* download_url = strdup(HTTP_DOWNLOAD_URI);
+            if (download_url) {
+                ESP_LOGI(TAG, "Starting model download from: %s", download_url);
+                xTaskCreate(download_model_task, "download_model", 8192, download_url, 5, NULL);
+            } else {
+                ESP_LOGE(TAG, "Failed to strdup URL for download");
+            }
         }
         break;
     default:
@@ -523,14 +679,13 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .listen_interval = 1,
-        },
-    };
+    wifi_config_t wifi_config = {};
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    memcpy(wifi_config.sta.ssid, WIFI_SSID, strlen(WIFI_SSID));
+    memcpy(wifi_config.sta.password, WIFI_PASS, strlen(WIFI_PASS));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.listen_interval = 1;
+
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
     ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", WIFI_SSID);
@@ -595,8 +750,9 @@ static void wifi_init_sta(void)
     xTaskCreate(vLogFreeHeap, "LogFreeHeap", 2048, NULL, 5, NULL);
 }
 
-void app_main(void)
+extern "C" void app_main(void)
 {
+    ESP_LOGI("MAIN", "App started");
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -605,14 +761,17 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
+    // Create a task for TFLite initialization to avoid blocking/crashing the main task
+    xTaskCreate(tflite_task, "tflite_task", 8192, NULL, 5, NULL);
+
     wifi_init_sta();
 
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-    };
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    memset(&mqtt_cfg, 0, sizeof(mqtt_cfg));
+    mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     global_client = client;
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
 }
