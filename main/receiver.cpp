@@ -24,7 +24,6 @@ extern "C" {
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/micro/system_setup.h"
-#include "model_data.h"
 
 #define ESP32_ID RACK_1
 
@@ -36,8 +35,8 @@ extern "C" {
 #define ESP32_THRESHOLD_TOPIC "/commands/" XSTR(ESP32_ID) "/thresholds"
 
 // Set your WiFi credentials here
-#define WIFI_SSID "LAPTOP-4MHUFCI0"
-#define WIFI_PASS "5La43:30"
+#define WIFI_SSID "<WIFI_SSID>"
+#define WIFI_PASS "<WIFI_PASS>"
 
 // Set your Pi 5 IP address here
 #define MQTT_BROKER_URI "mqtt://192.168.137.106:1883"
@@ -156,19 +155,25 @@ void tflite_init() {
     ESP_LOGI("TFLITE", "Initializing TFLite...");
     tflite::InitializeTarget();
 
-    // Use dynamic model if available, else static
-    const unsigned char* current_model_ptr = (dynamic_model_buffer != nullptr) ? dynamic_model_buffer : model_data;
+    if (dynamic_model_buffer == nullptr) {
+        ESP_LOGW("TFLITE", "No model downloaded yet. Waiting for MQTT trigger...");
+        return;
+    }
     
-    model = tflite::GetModel(current_model_ptr);
+    model = tflite::GetModel(dynamic_model_buffer);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE("TFLITE", "Model version mismatch!");
         return;
     }
 
     static tflite::MicroMutableOpResolver<5> resolver;
-    resolver.AddFullyConnected();
-    resolver.AddSoftmax();
-    resolver.AddRelu(); 
+    static bool ops_added = false;
+    if (!ops_added) {
+        resolver.AddFullyConnected();
+        resolver.AddSoftmax();
+        resolver.AddRelu(); 
+        ops_added = true;
+    }
 
     static tflite::MicroInterpreter static_interpreter(
         model, resolver, tensor_arena, kTensorArenaSize);
@@ -182,7 +187,7 @@ void tflite_init() {
 
     input = interpreter->input(0);
     output = interpreter->output(0);
-    ESP_LOGI("TFLITE", "TFLite Ready (Model: %s)", dynamic_model_buffer ? "Dynamic" : "Static");
+    ESP_LOGI("TFLITE", "TFLite Ready (Dynamic Model Loaded)");
 }
 
 void tflite_task(void *pvParameters) {
