@@ -464,6 +464,10 @@ static void send_batch_http_task(void *pvParameters)
         if (msg_obj) {
             cJSON_AddStringToObject(msg_obj, "event", "collection_complete");
             cJSON_AddStringToObject(msg_obj, "label", params->label);
+            if (current_session_id[0] != '\0') {
+                cJSON_AddStringToObject(msg_obj, "session", current_session_id);
+            }
+            cJSON_AddStringToObject(msg_obj, "source", "firmware");
             char *json_str = cJSON_PrintUnformatted(msg_obj);
             if (json_str) {
                 publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);

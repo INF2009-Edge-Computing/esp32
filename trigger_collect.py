@@ -10,17 +10,20 @@ RACK_ID = "RACK_1"
 
 COLLECTION_TOPIC = f"/commands/{RACK_ID}/collect" 
 MODEL_UPDATE_TOPIC = f"/commands/{RACK_ID}/update_model" 
+TRAINING_COMPLETE_TOPIC = f"/commands/{RACK_ID}/training_complete"
 
 def on_connect(client, userdata, flags, rc): 
     if rc == 0:
-		# sensor/<DEVICE_ID>/status
+        # sensor/<DEVICE_ID>/status
         client.subscribe("/sensors/+/status")
 
         print("Connected! Sending collect command...") 
-        # Send the command to the publisher 
-        client.publish(COLLECTION_TOPIC, "door-closed") 
+        # Send canonical state label + session payload
+        payload = '{"label":"door_closed","session":"manual_test"}'
+        client.publish(COLLECTION_TOPIC, payload)
         
         # client.publish(MODEL_UPDATE_TOPIC, "update!")
+        # client.publish(TRAINING_COMPLETE_TOPIC, '{"session":"manual_train"}')
     else: 
         print(f"Connection failed: {rc}") 
 

@@ -79,6 +79,31 @@ inf2009_proj/
 -- The `server.py` maintains an `active_sessions` dict; avoid breaking its
   interface when altering request headers.
 
+## Local-only change policy (user override)
+
+Until the user explicitly revokes this policy:
+
+-- Keep all code changes local in the working tree.
+-- Do **not** perform git state-changing operations such as commit, branch
+   creation/switching, merge, rebase, cherry-pick, reset, stash, tag, push,
+   pull, PR creation, or remote update commands.
+-- If asked for history inspection, use read-only git commands only (e.g.
+   `git log`, `git show`, `git diff`, `git status`, `git branch --all`).
+-- Prefer file transfer/deployment steps (`scp`, `idf.py flash`) without any
+   repository history changes.
+
+## Build-only local execution policy (user override)
+
+Until the user explicitly revokes this policy:
+
+-- Do **not** run application services or runtime workflows locally.
+-- Do **not** flash devices locally (`idf.py flash`) unless explicitly requested.
+-- Do **not** run serial monitor/device runtime commands locally (`idf.py monitor`).
+-- Local verification is limited to compile/build checks only (e.g. `idf.py build`,
+  syntax checks, static checks).
+-- Runtime execution and functional testing should be performed on the Pi 5 or ESP32
+  target devices.
+
 ## Deployment & updates
 
 Whenever you update scripts or firmware, the code must be transferred
