@@ -10,3 +10,4 @@ dependencies:
     - if: target in [esp32p4, esp32h2]
   espressif/mqtt: '*'
   espressif/mdns: ^1.0.0
+  espressif/esp-tflite-micro: "^1.0.0"
