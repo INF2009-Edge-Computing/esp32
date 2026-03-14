@@ -111,7 +111,34 @@ bool tflm_load_model(const unsigned char *model_data, size_t model_size) {
     return true;
 }
 
-int tflm_predict(const float *input, size_t len) {
+static float softmax_max(const float *vals, int n) {
+    if (!vals || n <= 0) {
+        return 0.0f;
+    }
+    float maxv = vals[0];
+    for (int i = 1; i < n; i++) {
+        if (vals[i] > maxv) {
+            maxv = vals[i];
+        }
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += expf(vals[i] - maxv);
+    }
+    if (sum <= 0.0f) {
+        return 0.0f;
+    }
+    float best = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float p = expf(vals[i] - maxv) / sum;
+        if (p > best) {
+            best = p;
+        }
+    }
+    return best;
+}
+
+int tflm_predict_with_confidence(const float *input, size_t len, float *out_confidence) {
     if (!g_interpreter || !g_input || !g_output) {
         set_error("interpreter not initialized");
         return -1;
@@ -121,6 +148,7 @@ int tflm_predict(const float *input, size_t len) {
         return -1;
     }
 
+    // Populate input tensor
     int input_count = 0;
     if (g_input->type == kTfLiteFloat32) {
         input_count = g_input->bytes / static_cast<int>(sizeof(float));
@@ -171,56 +199,64 @@ int tflm_predict(const float *input, size_t len) {
     }
 
     int output_count = 0;
+    float confidence = 0.0f;
+    int best = -1;
+
     if (g_output->type == kTfLiteFloat32) {
         output_count = g_output->bytes / static_cast<int>(sizeof(float));
         if (output_count <= 0) {
             set_error("invalid float output size");
             return -1;
         }
-        set_error("ok");
-        return argmax_float(g_output->data.f, output_count);
-    }
-
-    if (g_output->type == kTfLiteInt8) {
+        best = argmax_float(g_output->data.f, output_count);
+        confidence = softmax_max(g_output->data.f, output_count);
+    } else if (g_output->type == kTfLiteInt8) {
         output_count = g_output->bytes;
         if (output_count <= 0) {
             set_error("invalid int8 output size");
             return -1;
         }
-
-        int best = 0;
-        int8_t best_val = g_output->data.int8[0];
-        for (int i = 1; i < output_count; i++) {
-            if (g_output->data.int8[i] > best_val) {
-                best_val = g_output->data.int8[i];
-                best = i;
-            }
+        float scale = g_output->params.scale;
+        int zero_point = g_output->params.zero_point;
+        float tmp[32];
+        if (output_count > (int)(sizeof(tmp)/sizeof(tmp[0]))) {
+            set_error("output too large");
+            return -1;
         }
-        set_error("ok");
-        return best;
-    }
-
-    if (g_output->type == kTfLiteUInt8) {
+        for (int i = 0; i < output_count; i++) {
+            tmp[i] = (g_output->data.int8[i] - zero_point) * scale;
+        }
+        best = argmax_float(tmp, output_count);
+        confidence = softmax_max(tmp, output_count);
+    } else if (g_output->type == kTfLiteUInt8) {
         output_count = g_output->bytes;
         if (output_count <= 0) {
             set_error("invalid uint8 output size");
             return -1;
         }
-
-        int best = 0;
-        uint8_t best_val = g_output->data.uint8[0];
-        for (int i = 1; i < output_count; i++) {
-            if (g_output->data.uint8[i] > best_val) {
-                best_val = g_output->data.uint8[i];
-                best = i;
-            }
+        float scale = g_output->params.scale;
+        int zero_point = g_output->params.zero_point;
+        float tmp[32];
+        if (output_count > (int)(sizeof(tmp)/sizeof(tmp[0]))) {
+            set_error("output too large");
+            return -1;
         }
-        set_error("ok");
-        return best;
+        for (int i = 0; i < output_count; i++) {
+            tmp[i] = (g_output->data.uint8[i] - zero_point) * scale;
+        }
+        best = argmax_float(tmp, output_count);
+        confidence = softmax_max(tmp, output_count);
+    } else {
+        set_error("unsupported output tensor type");
+        return -1;
     }
 
-    set_error("unsupported output tensor type");
-    return -1;
+    if (out_confidence) {
+        *out_confidence = confidence;
+    }
+
+    set_error("ok");
+    return best;
 }
 
 void tflm_reset(void) {
