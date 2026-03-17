@@ -22,29 +22,26 @@ extern "C" {
 #include "esp_pm.h"
 #include "rom/ets_sys.h"
 #include "cJSON.h"
+#include "esp_crc.h"
 }
 
 #include "tflm_inference.h"
 
-#define ESP32_ID RACK_1
+// Node / network identity — configure via 'idf.py menuconfig' > CSI Node Configuration
+#define ESP32_ID_STR    CONFIG_CSI_NODE_ID
+#define WIFI_SSID       CONFIG_WIFI_SSID
+#define WIFI_PASS       CONFIG_WIFI_PASS
+#define MQTT_BROKER_URI CONFIG_MQTT_BROKER_URI
+#define HTTP_SERVER_BASE CONFIG_HTTP_SERVER_BASE
+#define HTTP_UPLOAD_URI  CONFIG_HTTP_SERVER_BASE "/upload_data"
+#define HTTP_MODEL_URI   CONFIG_HTTP_SERVER_BASE "/model/" CONFIG_CSI_NODE_ID
+#define HTTP_PARAMS_URI  CONFIG_HTTP_SERVER_BASE "/params/" CONFIG_CSI_NODE_ID
 
-#define STR(x) #x
-#define XSTR(x) STR(x)
-#define ESP32_COLLECT_TOPIC "/commands/" XSTR(ESP32_ID) "/collect"
-#define ESP32_DOWNLOAD_TOPIC "/commands/" XSTR(ESP32_ID) "/update_model"
-#define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" XSTR(ESP32_ID) "/training_complete"
-#define ESP32_STATUS_TOPIC "/sensors/" XSTR(ESP32_ID) "/status"
-
-// Set your WiFi credentials here
-#define WIFI_SSID "Wifi"
-#define WIFI_PASS "Password"
-
-// Set your Pi 5 IP address here
-#define MQTT_BROKER_URI "mqtt://192.168.0.22:1883"
-#define HTTP_UPLOAD_URI "http://192.168.0.22:5000/upload_data"
-#define HTTP_SERVER_BASE "http://192.168.0.22:5000"
-#define HTTP_MODEL_URI HTTP_SERVER_BASE "/model/" XSTR(ESP32_ID)
-#define HTTP_PARAMS_URI HTTP_SERVER_BASE "/params/" XSTR(ESP32_ID)
+// MQTT topic construction uses the node ID string from Kconfig
+#define ESP32_COLLECT_TOPIC           "/commands/" CONFIG_CSI_NODE_ID "/collect"
+#define ESP32_DOWNLOAD_TOPIC          "/commands/" CONFIG_CSI_NODE_ID "/update_model"
+#define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" CONFIG_CSI_NODE_ID "/training_complete"
+#define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
 #define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
@@ -60,6 +57,11 @@ static int64_t last_trigger_us = 0; // Last time we accepted a packet for proces
 #define SAMPLE_SIZE 200                                  // 20 seconds of data at 10Hz
 #define SUB_BATCH_SIZE 40                                // packets per HTTP sub-batch
 static uint8_t csi_buffer[SUB_BATCH_SIZE][ACTIVE_SUBCARRIERS];
+
+// Idempotency key format: "<session_id>_<sub_batch_idx>".
+// session_id is typically a timestamp string (~14 chars), and the index is small.
+// Reserve a conservative upper bound (including null terminator).
+static const size_t IDEMPOTENCY_KEY_MAX_LEN = 64;
 static uint8_t packet_idx = 0;
 static uint8_t sub_batch_idx = 0;
 static bool is_collecting = false;
@@ -92,6 +94,22 @@ typedef struct {
 
 static esp_http_client_handle_t client = NULL;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
+
+// Cap the exponent to prevent excessive delays (base_ms * 2^exponent).
+// With base_ms=500 and max_exponent=6, the maximum base delay is 32s.
+static const int MAX_BACKOFF_EXPONENT = 6;
+
+static uint32_t backoff_jitter_ms(int attempt, uint32_t base_ms) {
+    // exponential backoff with +/-50% jitter: base * 2^exponent +/- 50%
+    // Range: [cap/2, 3*cap/2]
+    int backoff_exponent = (attempt < MAX_BACKOFF_EXPONENT) ? attempt : MAX_BACKOFF_EXPONENT;
+    uint32_t cap = base_ms * (1u << backoff_exponent);
+    uint32_t half = cap / 2;
+    // jitter in [0, cap]
+    uint32_t jitter = esp_random() % (cap + 1);
+    uint32_t val = cap - half + jitter; // [cap/2, 3*cap/2]
+    return val < base_ms ? base_ms : val;
+}
 
 static bool publish_with_retry(const char *topic, const char *payload, int qos)
 {
@@ -510,7 +528,7 @@ static void download_model_and_params_task(void *pvParameters)
         }
 
         ESP_LOGW(TAG, "Model/scaler download attempt %d/3 failed", attempt);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(backoff_jitter_ms(attempt - 1, 500)));
     }
 
     model_ready = false;
@@ -552,7 +570,7 @@ static void send_batch_http_task(void *pvParameters)
 
     // Tell server the label for this batch in HTTP headers
     esp_http_client_set_header(client, "X-Room-State", params->label);
-    esp_http_client_set_header(client, "X-ESP32-ID", XSTR(ESP32_ID));
+    esp_http_client_set_header(client, "X-ESP32-ID", CONFIG_CSI_NODE_ID);
     if (current_session_id[0] != '\0') {
         esp_http_client_set_header(client, "X-Session-ID", current_session_id);
     }
@@ -569,6 +587,20 @@ static void send_batch_http_task(void *pvParameters)
     // Set header to tell server this is binary data
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
     esp_http_client_set_post_field(client, (const char *)csi_buffer, sizeof(csi_buffer));
+
+    // Compute CRC32 of payload for integrity check
+    uint32_t crc32_val = esp_crc32_le(0, (const uint8_t *)csi_buffer, sizeof(csi_buffer));
+    // CRC32 is 32 bits; formatted as 8 hex digits plus null terminator.
+    // Buffer size 9 is sufficient for any 32-bit hex string.
+    char crc32_str[9];
+    snprintf(crc32_str, sizeof(crc32_str), "%08" PRIx32, crc32_val);
+    esp_http_client_set_header(client, "X-CRC32", crc32_str);
+
+    // Idempotency key: session + sub-batch index (content changes are caught by CRC)
+    // Expected session_id format is a timestamp (14 chars) and sub_batch_idx is small.
+    char idem_key[IDEMPOTENCY_KEY_MAX_LEN];
+    snprintf(idem_key, sizeof(idem_key), "%s_%d", current_session_id, params->sub_batch_idx);
+    esp_http_client_set_header(client, "X-Idempotency-Key", idem_key);
 
     uint32_t heap_before = esp_get_free_heap_size();
     uint32_t min_heap_before = esp_get_minimum_free_heap_size();
@@ -616,7 +648,7 @@ static void send_batch_http_task(void *pvParameters)
                 break;
             }
             err = esp_http_client_set_header(client, "X-Room-State", params->label);
-            esp_http_client_set_header(client, "X-ESP32-ID", XSTR(ESP32_ID));
+            esp_http_client_set_header(client, "X-ESP32-ID", CONFIG_CSI_NODE_ID);
             if (current_session_id[0] != '\0') {
                 esp_http_client_set_header(client, "X-Session-ID", current_session_id);
             }
@@ -628,8 +660,10 @@ static void send_batch_http_task(void *pvParameters)
             esp_http_client_set_header(client, "X-Total-Sub-Batches", total_batches_str);
             esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
             esp_http_client_set_post_field(client, (const char *)csi_buffer, sizeof(csi_buffer));
+            esp_http_client_set_header(client, "X-CRC32", crc32_str);
+            esp_http_client_set_header(client, "X-Idempotency-Key", idem_key);
 
-            vTaskDelay(pdMS_TO_TICKS(500 * (retries + 1)));
+            vTaskDelay(pdMS_TO_TICKS(backoff_jitter_ms(retries, 500)));
             err = esp_http_client_perform(client);
             retries++;
         }

@@ -30,7 +30,11 @@ build/
 *.map
 flasher_args.json # Generated in build directory
 sdkconfig.old
-# sdkconfig
+sdkconfig
+sdkconfig.defaults.local
+
+# Environment variables — never commit real credentials
+.env
 
 # ESP-IDF dependencies
 # For older versions or manual component management

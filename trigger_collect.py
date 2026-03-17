@@ -1,12 +1,16 @@
+import os
 import paho.mqtt.client as mqtt 
 import time 
- 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Configuration 
-BROKER_IP = "localhost" 
-BROKER_PORT = 1883 
+BROKER_IP = os.getenv("MQTT_BROKER", "localhost") 
+BROKER_PORT = int(os.getenv("MQTT_PORT", "1883")) 
 
 # This should be set dynamically from the dashboard to trigger commands for specific receivers
-RACK_ID = "RACK_1"
+RACK_ID = os.getenv("RACK_ID", "RACK_1")
 
 COLLECTION_TOPIC = f"/commands/{RACK_ID}/collect" 
 MODEL_UPDATE_TOPIC = f"/commands/{RACK_ID}/update_model" 

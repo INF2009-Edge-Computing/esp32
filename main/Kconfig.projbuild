@@ -1,17 +1,36 @@
-menu "Example Configuration"
+menu "CSI Node Configuration"
 
-    config EXAMPLE_SCAN_LIST_SIZE
-        int "Max size of scan list"
-        range 0 20
-        default 10
+    config CSI_NODE_ID
+        string "ESP32 Node ID (e.g. RACK_1)"
+        default "RACK_1"
         help
-            The size of array that will be used to retrieve the list of access points.
+            Unique identifier for this ESP32 node. Must match the
+            RACK_ID used in the Pi-side dashboard and server.
 
-    config EXAMPLE_USE_SCAN_CHANNEL_BITMAP
-        bool "Scan only non overlapping channels using Channel bitmap"
-        default 0
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default "Wifi"
         help
-            Enable this to scan only the non overlapping channels i.e 1,6,11 by mentioning a channel bitmap
-            in scan config. If you wish to scan a different set of specific channels, please edit the channel_list
-            array in scan.c. Channels for a 2.4 ghz network range should range from 1-14.
+            SSID of the 2.4 GHz access point to connect to.
+
+    config WIFI_PASS
+        string "Wi-Fi Password"
+        default ""
+        help
+            Password for the above SSID. Leave blank for open networks.
+
+    config MQTT_BROKER_URI
+        string "MQTT Broker URI"
+        default "mqtt://192.168.0.x:1883"
+        help
+            Full URI of the MQTT broker, e.g. mqtt://192.168.0.22:1883 .
+            Must include scheme and port.
+
+    config HTTP_SERVER_BASE
+        string "HTTP Server Base URL"
+        default "http://192.168.0.x:5000"
+        help
+            Base URL of the Pi Flask ingest server (no trailing slash),
+            e.g. http://192.168.0.22:5000 .
+
 endmenu

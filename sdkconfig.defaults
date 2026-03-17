@@ -1,0 +1,10 @@
+# sdkconfig.defaults — Baseline config entries.
+# Copy to sdkconfig or run 'idf.py menuconfig' to set real values.
+# Credentials are set via 'idf.py menuconfig' > CSI Node Configuration.
+#
+# Example entries (fill in real values via menuconfig):
+#   CONFIG_CSI_NODE_ID="RACK_1"
+#   CONFIG_WIFI_SSID="YourSSID"
+#   CONFIG_WIFI_PASS="YourPassword"
+#   CONFIG_MQTT_BROKER_URI="mqtt://192.168.0.x:1883"
+#   CONFIG_HTTP_SERVER_BASE="http://192.168.0.x:5000"

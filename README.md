@@ -17,11 +17,11 @@
 >
 > 3. From this directory you can run the Python servers, scripts, or build the ESP32 image.
 >
-+End-to-end edge pipeline using an **ESP32-C3** (CSI capture + upload) and a **Raspberry Pi 5** (MQTT broker + HTTP ingest server).
+End-to-end edge pipeline using an **ESP32-C3** (CSI capture + upload) and a **Raspberry Pi 5** (MQTT broker + HTTP ingest server).
 
 This project works in two parts:
 
-- **ESP32 firmware** (`main/receiver.c`) captures CSI packets and uploads data to the Pi.
+- **ESP32 firmware** (`main/receiver.cpp`) captures CSI packets and uploads data to the Pi.
 - **Pi-side Python services** receive control commands (MQTT) and store uploaded CSI batches (HTTP).
 
 ---
@@ -70,7 +70,7 @@ Optional:
 
 ## Project files you will use
 
-- `main/receiver.c` — ESP32 firmware (Wi-Fi, MQTT, CSI, HTTP upload)
+- `main/receiver.cpp` — ESP32 firmware (Wi-Fi, MQTT, CSI, HTTP upload)
 - `server.py` — Flask HTTP ingest endpoint (`/upload_data`)
 - `trigger_collect.py` — sends MQTT collect command
 - `broadcast_generator.py` — sends UDP broadcast packet repeatedly
@@ -99,21 +99,34 @@ pip install flask numpy pandas paho-mqtt
 
 ---
 
-## 2) Configure ESP32 firmware
+## Configuration
 
-Open `main/receiver.c` and update these values:
+### Python helper scripts (trigger_collect.py, testlog.py)
 
-- `WIFI_SSID`
-- `WIFI_PASS`
-- `MQTT_BROKER_URI` → Pi IP, e.g. `mqtt://10.198.7.22:1883`
-- `HTTP_UPLOAD_URI` → Pi IP, e.g. `http://10.198.7.22:5000/upload_data`
+```bash
+cp .env.example .env
+# edit .env — set MQTT_BROKER, RACK_ID, HTTP_SERVER_BASE
+```
 
-Also note:
+### ESP32 firmware credentials
 
-- `#define ESP32_ID RACK_1`
-- `trigger_collect.py` must use the same rack id (`RACK_ID = "RACK_1"`)
+WiFi credentials, MQTT broker URI, HTTP server URL, and node ID are now set via menuconfig — they are **not** hardcoded in source:
 
-If they do not match, commands will not reach the device.
+```bash
+cd edge-esp32
+idf.py menuconfig
+# Navigate to: CSI Node Configuration
+# Set: Wi-Fi SSID, Wi-Fi Password, MQTT Broker URI, HTTP Server Base URL, Node ID
+```
+
+After setting values, build and flash normally:
+
+```bash
+idf.py build
+idf.py -p <PORT> flash
+```
+
+`sdkconfig.defaults` documents the keys with placeholder comments.
 
 ---
 
@@ -162,10 +175,10 @@ python3 broadcast_generator.py
 
 ```bash
 python3 trigger_collect.py
-```tri
+```
 
-If running `trigger_collect.py` on the Pi, `BROKER_IP = "localhost"` is fine.
-If running it from another machine, set `BROKER_IP` to the Pi IP.
+If running `trigger_collect.py` on the Pi, setting `MQTT_BROKER=localhost` in `.env` is fine.
+If running it from another machine, set `MQTT_BROKER` to the Pi IP.
 
 ---
 
@@ -191,10 +204,10 @@ After all parts arrive, it merges and writes final file:
 ## 6) Quick verification checklist
 
 - ESP32 and Pi are on reachable network paths.
-- `MQTT_BROKER_URI` and `HTTP_UPLOAD_URI` point to Pi IP.
+- MQTT Broker URI and HTTP Server Base URL are set correctly in `idf.py menuconfig`.
 - Mosquitto is running on port `1883`.
 - Flask server is running on port `5000`.
-- `RACK_ID` in `trigger_collect.py` matches `ESP32_ID` in firmware.
+- `RACK_ID` in `.env` for `trigger_collect.py` matches the firmware Node ID.
 
 ---
 
@@ -203,12 +216,12 @@ After all parts arrive, it merges and writes final file:
 ### ESP32 does not receive collect command
 
 - Check topic naming mismatch (`RACK_1` vs other ID).
-- Check MQTT broker IP/port in `receiver.c`.
+- Check MQTT broker URI in firmware menuconfig (`CSI Node Configuration`).
 - Confirm broker is running: `sudo systemctl status mosquitto`.
 - If the ESP32 log shows errors like `esp-tls: couldn't get hostname for :192.168.X.X`
   or `Cannot publish, MQTT not connected`, the URI parsing may have failed.
   You can avoid this by specifying the broker as host/port instead of
-  `mqtt://...` (see the top of `main/receiver.c`).
+  `mqtt://...` (see `main/receiver.cpp`).
   Ensure you set the values in the nested `broker.address` struct; e.g.:  
   ```c
   esp_mqtt_client_config_t cfg = {
@@ -217,14 +230,13 @@ After all parts arrive, it merges and writes final file:
       .broker.address.transport = MQTT_TRANSPORT_OVER_TCP, // required
   };
   ```
-- Whenever the Pi’s IP changes (e.g. now `10.198.7.22`), update the
-  `MQTT_BROKER_HOST`/`MQTT_BROKER_PORT` (and `HTTP_UPLOAD_URI`) in `receiver.c`,
-  then **rebuild and reflash the ESP32** so the firmware uses the new address.
+- Whenever the Pi’s IP changes, re-run `idf.py menuconfig` and update
+  MQTT broker URI / HTTP server base URL, then **rebuild and reflash the ESP32**.
 
 ### `server.py` prints `Wrong Size` / `DATA MISMATCH`
 
 - Firmware/server constants must stay aligned:
-	- subcarrier packing logic in `receiver.c`
+  - subcarrier packing logic in `receiver.cpp`
 	- `SUB_BATCH_SIZE` and expected payload logic in `server.py`
 
 ### No final merged CSV appears
@@ -267,9 +279,9 @@ correct.
 
 ## Current defaults in repository
 
-- MQTT broker URI in firmware: `mqtt://10.198.7.22:1883`
-- HTTP upload URI in firmware: `http://10.198.7.22:5000/upload_data`
-- Trigger script broker default: `localhost`
+- Python helper script defaults are in `.env.example`.
+- Firmware configuration keys are documented in `sdkconfig.defaults`.
+- Actual runtime firmware values are set via `idf.py menuconfig` under **CSI Node Configuration**.
 
 Adjust these values to your environment before running.
 
