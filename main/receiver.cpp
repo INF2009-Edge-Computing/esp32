@@ -6,6 +6,7 @@ extern "C" {
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_event.h"
@@ -20,6 +21,7 @@ extern "C" {
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
+#include "esp_heap_caps.h"
 #include "rom/ets_sys.h"
 #include "cJSON.h"
 #include "esp_crc.h"
@@ -84,7 +86,30 @@ static int pred_history_idx = 0;
 static int pred_history_count = 0;
 static int current_majority_state = -1;
 static bool wifi_connected = false;
+static bool mqtt_connected = false;
 static bool model_download_in_progress = false;
+
+// Status heartbeat task: send only when key state changes (or periodically)
+// to reduce heap allocations / wakeups.
+#define HEARTBEAT_INTERVAL_MS (60 * 1000) // 1 minute
+
+static TaskHandle_t status_task_handle = NULL;
+static bool last_published_mqtt_connected = false;
+static bool last_published_model_ready = false;
+static bool last_published_model_download_armed = false;
+
+static void notify_status_task(void)
+{
+    if (status_task_handle != NULL) {
+        xTaskNotifyGive(status_task_handle);
+    }
+}
+
+typedef struct {
+    uint8_t normalized[ACTIVE_SUBCARRIERS];
+} inference_sample_t;
+
+static QueueHandle_t inference_queue = NULL;
 
 typedef struct {
     char *label;
@@ -94,6 +119,7 @@ typedef struct {
 
 static esp_http_client_handle_t client = NULL;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
+static const char MQTT_OFFLINE_WILL_PAYLOAD[] = "{\"event\":\"node_offline\"}";
 
 // Cap the exponent to prevent excessive delays (base_ms * 2^exponent).
 // With base_ms=500 and max_exponent=6, the maximum base delay is 32s.
@@ -111,24 +137,51 @@ static uint32_t backoff_jitter_ms(int attempt, uint32_t base_ms) {
     return val < base_ms ? base_ms : val;
 }
 
-static bool publish_with_retry(const char *topic, const char *payload, int qos)
+static bool publish_with_retry_ex(const char *topic, const char *payload, int qos, bool retain)
 {
     if (mqtt_client == NULL) {
-        ESP_LOGW(TAG, "publish_with_retry: mqtt_client is NULL");
+        ESP_LOGW(TAG, "publish_with_retry: mqtt_client is NULL (topic=%s)", topic);
         return false;
     }
 
     const int max_attempts = 5;
     for (int attempt = 0; attempt < max_attempts; attempt++) {
-        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, qos, 0);
+        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, qos, retain ? 1 : 0);
         if (msg_id >= 0) {
+            if (attempt > 0) {
+                ESP_LOGI(TAG, "publish succeeded after %d retries (topic=%s)", attempt, topic);
+            }
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(100 * (1 << attempt)));
     }
 
-    ESP_LOGW(TAG, "publish failed topic=%s payload=%s", topic, payload);
+    ESP_LOGW(TAG, "publish failed after %d attempts (topic=%s payload=%s)", max_attempts, topic, payload);
     return false;
+}
+
+static bool publish_with_retry(const char *topic, const char *payload, int qos)
+{
+    return publish_with_retry_ex(topic, payload, qos, false);
+}
+
+static void publish_status(const char *event, bool include_model_status, bool retain)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+    cJSON_AddStringToObject(obj, "event", event);
+    if (include_model_status) {
+        cJSON_AddBoolToObject(obj, "model_ready", model_ready);
+        cJSON_AddBoolToObject(obj, "model_download_armed", model_download_armed);
+    }
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry_ex(ESP32_STATUS_TOPIC, json_str, 1, retain);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
 }
 
 static void publish_ack(const char *cmd)
@@ -260,6 +313,10 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
         return err;
     }
 
+    uint32_t free_heap_before = esp_get_free_heap_size();
+    uint32_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "http_get_buffer: free heap before download=%u largest_block=%u", free_heap_before, largest_before);
+
     int64_t content_len = esp_http_client_fetch_headers(h);
     if (content_len < 0) {
         ESP_LOGW(TAG, "http_get_buffer fetch_headers failed (%lld) for %s", content_len, url);
@@ -276,10 +333,36 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
         return ESP_FAIL;
     }
 
-    size_t alloc_len = (content_len > 0 && content_len < (1024 * 1024)) ? (size_t)(content_len + 1) : 4096;
+    // Prefer exact allocation when content length is known to avoid realloc
+    // fragmentation churn on low-memory devices.
+    size_t alloc_len = (content_len > 0 && content_len < (1024 * 1024)) ? (size_t)(content_len + 1) : 2048;
     const size_t max_len = 1024 * 1024;
+
+    if (content_len > 0) {
+        uint32_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        ESP_LOGI(TAG, "http_get_buffer: status=%d content_len=%lld alloc_len=%u largest_block=%u",
+                 status,
+                 content_len,
+                 (unsigned)alloc_len,
+                 (unsigned)largest_now);
+        if ((size_t)largest_now < alloc_len) {
+            ESP_LOGW(TAG, "http_get_buffer: largest block too small for %s (need=%u, largest=%u)",
+                     url,
+                     (unsigned)alloc_len,
+                     (unsigned)largest_now);
+            esp_http_client_close(h);
+            esp_http_client_cleanup(h);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     uint8_t *buf = (uint8_t *)malloc(alloc_len);
     if (!buf) {
+        ESP_LOGW(TAG,
+                 "http_get_buffer malloc(%u) failed, free heap=%u largest=%u",
+                 (unsigned)alloc_len,
+                 esp_get_free_heap_size(),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         esp_http_client_close(h);
         esp_http_client_cleanup(h);
         return ESP_ERR_NO_MEM;
@@ -299,6 +382,12 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
 
             uint8_t *grown = (uint8_t *)realloc(buf, new_len);
             if (!grown) {
+                ESP_LOGW(TAG,
+                         "http_get_buffer realloc(%u) failed for %s, free=%u largest=%u",
+                         (unsigned)new_len,
+                         url,
+                         esp_get_free_heap_size(),
+                         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
                 free(buf);
                 esp_http_client_close(h);
                 esp_http_client_cleanup(h);
@@ -461,26 +550,94 @@ static void update_majority_and_notify(int pred)
     cJSON_Delete(obj);
 }
 
+static void vInferenceTask(void *pvParameters)
+{
+    (void)pvParameters;
+
+    inference_sample_t sample;
+    for (;;) {
+        if (inference_queue == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (xQueueReceive(inference_queue, &sample, pdMS_TO_TICKS(1000)) == pdPASS) {
+            if (!model_ready) {
+                continue;
+            }
+
+            float model_input[ACTIVE_SUBCARRIERS];
+            for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+                float sigma = std_vals[i];
+                if (sigma == 0.0f) {
+                    sigma = 1.0f;
+                }
+                model_input[i] = (((float)sample.normalized[i]) - mean_vals[i]) / sigma;
+            }
+
+            int pred = run_model(model_input, ACTIVE_SUBCARRIERS);
+            update_majority_and_notify(pred);
+
+            // Yield to keep the networking tasks responsive.
+            taskYIELD();
+        }
+    }
+}
+
 static void download_model_and_params_task(void *pvParameters)
 {
     (void)pvParameters;
+
+    // Remove any previously loaded model before downloading a new one. This
+    // frees RAM and avoids leaving stale model state in place.
+    if (model_buffer) {
+        free(model_buffer);
+        model_buffer = NULL;
+        model_size = 0;
+        model_ready = false;
+        tflm_reset();
+        ESP_LOGI(TAG, "Cleared existing model from RAM before downloading a new one");
+        notify_status_task();
+    }
 
     for (int attempt = 1; attempt <= 3; attempt++) {
         uint8_t *downloaded_model = NULL;
         uint8_t *downloaded_params = NULL;
         int model_len = 0;
         int params_len = 0;
+        bool scaler_ok = false;
 
-        ESP_LOGI(TAG, "Model download attempt %d/3: fetching %s and %s", attempt, HTTP_MODEL_URI, HTTP_PARAMS_URI);
+        // If an upload HTTP client is still around, release it to maximize
+        // available heap before model/scaler download.
+        if (client != NULL) {
+            esp_http_client_cleanup(client);
+            client = NULL;
+        }
+
+        ESP_LOGI(TAG, "Model download attempt %d/3: free heap=%u fetching %s and %s", attempt, esp_get_free_heap_size(), HTTP_MODEL_URI, HTTP_PARAMS_URI);
         log_resolved_host(HTTP_MODEL_URI);
         log_resolved_host(HTTP_PARAMS_URI);
-        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len);
-        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len);
 
-        ESP_LOGI(TAG, "Download results: model err=%s len=%d, params err=%s len=%d", esp_err_to_name(e1), model_len, esp_err_to_name(e2), params_len);
+        // Download and parse scaler first, then free it before model download
+        // to lower peak RAM pressure.
+        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len);
+        if (e2 == ESP_OK) {
+            scaler_ok = load_scaler_params(downloaded_params, params_len);
+            free(downloaded_params);
+            downloaded_params = NULL;
+        }
+
+        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len);
+
+        ESP_LOGI(TAG,
+                 "Download results: model err=%s len=%d, params err=%s len=%d scaler_ok=%d largest_block=%u",
+                 esp_err_to_name(e1),
+                 model_len,
+                 esp_err_to_name(e2),
+                 params_len,
+                 scaler_ok,
+                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
         if (e1 == ESP_OK && e2 == ESP_OK) {
-            bool scaler_ok = load_scaler_params(downloaded_params, params_len);
             bool model_ok = tflm_load_model(downloaded_model, (size_t)model_len);
             if (!scaler_ok) {
                 ESP_LOGW(TAG, "Scaler params load failed (len=%d)", params_len);
@@ -495,6 +652,7 @@ static void download_model_and_params_task(void *pvParameters)
                 model_buffer = downloaded_model;
                 model_size = (size_t)model_len;
                 model_ready = true;
+                notify_status_task();
                 reset_prediction_history();
 
                 cJSON *obj = cJSON_CreateObject();
@@ -509,7 +667,6 @@ static void download_model_and_params_task(void *pvParameters)
                     cJSON_Delete(obj);
                 }
 
-                free(downloaded_params);
                 ESP_LOGI(TAG, "Model/scaler downloaded (%d bytes)", model_len);
                 model_download_in_progress = false;
                 vTaskDelete(NULL);
@@ -532,6 +689,7 @@ static void download_model_and_params_task(void *pvParameters)
     }
 
     model_ready = false;
+    notify_status_task();
     tflm_reset();
 
     cJSON *obj = cJSON_CreateObject();
@@ -788,18 +946,12 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     // Print current CSI vector continuously for monitor visibility.
     log_current_csi_row(normalized_row, valid_sc_count, info->rx_ctrl.rssi);
 
-    // --- PATH A: INFERENCE (always active after model download) ---
-    if (model_ready) {
-        float model_input[ACTIVE_SUBCARRIERS] = {0};
-        for (uint8_t i = 0; i < valid_sc_count && i < ACTIVE_SUBCARRIERS; i++) {
-            float sigma = std_vals[i];
-            if (sigma == 0.0f) {
-                sigma = 1.0f;
-            }
-            model_input[i] = (((float)normalized_row[i]) - mean_vals[i]) / sigma;
-        }
-        int pred = run_model(model_input, ACTIVE_SUBCARRIERS);
-        update_majority_and_notify(pred);
+    // --- PATH A: INFERENCE (offloaded to a separate task to avoid blocking the Wi‑Fi callback) ---
+    if (model_ready && inference_queue) {
+        inference_sample_t sample;
+        memcpy(sample.normalized, normalized_row, ACTIVE_SUBCARRIERS);
+        // Non-blocking: drop if queue is full.
+        xQueueSendToBack(inference_queue, &sample, 0);
     }
 
     // --- PATH B: DATA COLLECTION (gated by MQTT command) ---
@@ -855,11 +1007,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT Connected");
+        ESP_LOGI(TAG, "MQTT Connected (broker=%s)", MQTT_BROKER_URI);
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_TRAINING_COMPLETE_TOPIC, 1);
         mqtt_client = event->client;
+        mqtt_connected = true;
+        // Notify the dashboard that we are online and include model status.
+        publish_status("node_online", true, true);
+        notify_status_task();
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT Disconnected");
+        mqtt_connected = false;
+        publish_status("node_offline", false, true);
+        mqtt_client = NULL;
+        notify_status_task();
         break;
 
     case MQTT_EVENT_DATA:
@@ -913,6 +1077,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         } else if (mqtt_topic_equals(event, ESP32_TRAINING_COMPLETE_TOPIC)) {
             publish_ack("training_complete");
             model_download_armed = true;
+            notify_status_task();
 
             if (model_download_in_progress) {
                 ESP_LOGW(TAG, "Ignoring training_complete: model download already in progress");
@@ -1007,13 +1172,53 @@ static void vLogFreeHeap(void *pvParameters)
 {
     (void)pvParameters;
 
-    TickType_t xLastWakeTime;
-    const TickType_t xFrequency = pdMS_TO_TICKS(10000);
-    xLastWakeTime = xTaskGetTickCount();
+    // Ensure first heartbeat is sent even if no state change occurs.
+    last_published_mqtt_connected = !mqtt_connected;
+    last_published_model_ready = !model_ready;
+    last_published_model_download_armed = !model_download_armed;
 
     for (;;) {
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-        ESP_LOGI("FREE_HEAP", "Free Heap: %" PRIu32 " bytes", esp_get_free_heap_size());
+        // Wake on state changes (notify_status_task) or after a long interval.
+        // Using a long timeout reduces wakeups and keeps CPU usage low.
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
+
+        bool changed = (mqtt_connected != last_published_mqtt_connected) ||
+                       (model_ready != last_published_model_ready) ||
+                       (model_download_armed != last_published_model_download_armed);
+
+        // Ping at least once every HEARTBEAT_INTERVAL_MS to keep dashboard aware.
+        if (!changed && notified == 0) {
+            changed = true;
+        }
+
+        if (!changed) {
+            continue;
+        }
+
+        last_published_mqtt_connected = mqtt_connected;
+        last_published_model_ready = model_ready;
+        last_published_model_download_armed = model_download_armed;
+
+        uint32_t heap = esp_get_free_heap_size();
+        ESP_LOGI("FREE_HEAP", "Free Heap: %" PRIu32 " bytes | MQTT=%s | model_ready=%d | download_armed=%d",
+                 heap,
+                 mqtt_connected ? "yes" : "no",
+                 model_ready,
+                 model_download_armed);
+
+        char hb_buf[128];
+        int len = snprintf(hb_buf, sizeof(hb_buf),
+                           "{\"event\":\"heartbeat\",\"mqtt_connected\":%s,\"model_ready\":%s,\"model_download_armed\":%s}",
+                           mqtt_connected ? "true" : "false",
+                           model_ready ? "true" : "false",
+                           model_download_armed ? "true" : "false");
+        if (len > 0 && len < (int)sizeof(hb_buf)) {
+            if (!publish_with_retry(ESP32_STATUS_TOPIC, hb_buf, 1)) {
+                ESP_LOGW(TAG, "Heartbeat publish failed");
+            }
+        } else {
+            ESP_LOGW(TAG, "Heartbeat message truncated");
+        }
     }
 }
 
@@ -1091,7 +1296,18 @@ static void wifi_init_sta(void)
     esp_wifi_set_csi(true);
 
     ESP_LOGI(TAG, "WiFi init and CSI setup complete");
-    xTaskCreate(vLogFreeHeap, "LogFreeHeap", 2048, NULL, 5, NULL);
+    xTaskCreate(vLogFreeHeap, "LogFreeHeap", 2048, NULL, 5, &status_task_handle);
+
+    // Inference offload: do TFLM inference outside of the Wi‑Fi CSI callback
+    // so the Wi‑Fi stack and MQTT keep-alive remain responsive.
+    inference_queue = xQueueCreate(16, sizeof(inference_sample_t));
+    if (inference_queue) {
+        // Run inference at a lower priority than the Wi-Fi/MQTT stack so
+        // they remain responsive even when inference computation is heavy.
+        xTaskCreate(vInferenceTask, "Inference", 8192, NULL, 2, NULL);
+    } else {
+        ESP_LOGW(TAG, "Failed to create inference queue");
+    }
 }
 
 extern "C" void app_main(void)
@@ -1112,6 +1328,11 @@ extern "C" void app_main(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
+    mqtt_cfg.session.last_will.topic = ESP32_STATUS_TOPIC;
+    mqtt_cfg.session.last_will.msg = MQTT_OFFLINE_WILL_PAYLOAD;
+    mqtt_cfg.session.last_will.msg_len = strlen(MQTT_OFFLINE_WILL_PAYLOAD);
+    mqtt_cfg.session.last_will.qos = 1;
+    mqtt_cfg.session.last_will.retain = true;
 
     esp_mqtt_client_handle_t client_handle = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(client_handle,

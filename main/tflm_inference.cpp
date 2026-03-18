@@ -9,7 +9,11 @@
 
 namespace {
 
-constexpr int kTensorArenaSize = 90 * 1024;
+// The tensor arena is the largest fixed RAM allocation in this firmware.
+// Lowering it reduces heap pressure at the cost of limiting model complexity.
+// 48 KB has proven sufficient for the current dense model while freeing more
+// heap for HTTP model download buffers on ESP32-C3.
+constexpr int kTensorArenaSize = 48 * 1024;
 alignas(16) static uint8_t g_tensor_arena[kTensorArenaSize];
 
 static const tflite::Model *g_model = nullptr;
