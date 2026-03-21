@@ -4,6 +4,7 @@ extern "C" {
 #include <stdlib.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -43,6 +44,7 @@ extern "C" {
 #define ESP32_COLLECT_TOPIC           "/commands/" CONFIG_CSI_NODE_ID "/collect"
 #define ESP32_DOWNLOAD_TOPIC          "/commands/" CONFIG_CSI_NODE_ID "/update_model"
 #define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" CONFIG_CSI_NODE_ID "/training_complete"
+#define ESP32_LOAD_MODEL_TOPIC        "/commands/" CONFIG_CSI_NODE_ID "/load_model"
 #define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
 #define DEFAULT_SCAN_LIST_SIZE 20
 
@@ -54,6 +56,12 @@ extern "C" {
 #define EXPECTED_PERIOD_US 100000 // 10Hz expected period between packets
 
 #define ACTIVE_SUBCARRIERS (MAX_UPPER - MAX_LOWER)
+#define COMPACT_FEATURE_COUNT 51
+#define LEGACY_RAW55_FEATURE_COUNT 55
+#define LEGACY_RAW56_FEATURE_COUNT ACTIVE_SUBCARRIERS
+#define MAX_MODEL_FEATURES_PER_FRAME (ACTIVE_SUBCARRIERS + 8)
+#define NOTEBOOK_MAX_EXTRACT_WINDOW 16
+#define FEATURE_EPSILON 1e-6f
 static int64_t last_trigger_us = 0; // Last time we accepted a packet for processing
 
 #define SAMPLE_SIZE 200                                  // 20 seconds of data at 10Hz
@@ -76,15 +84,47 @@ static uint8_t *model_buffer = NULL;
 static size_t model_size = 0;
 static bool model_ready = false;
 static bool model_download_armed = false;
-static float mean_vals[ACTIVE_SUBCARRIERS] = {0};
-static float std_vals[ACTIVE_SUBCARRIERS] = {0};
+static bool auto_load_model_on_reconnect = true;  // Auto-reload model on MQTT connection
+static float mean_vals[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+static float std_vals[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+static float *model_window_ring = NULL;
+static float *model_input_scratch = NULL;
+static size_t model_input_elements = ACTIVE_SUBCARRIERS;
+static size_t model_features_per_frame = ACTIVE_SUBCARRIERS;
+static size_t model_window_size = 1;
+static size_t model_window_fill = 0;
+static size_t model_window_head = 0;
+static bool notebook_mode_enabled = false;
+static int selected_subcarriers[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+static int selected_raw_indices[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+static size_t selected_subcarrier_count = 0;
+static int notebook_extract_window_size = 5;
+static int notebook_calibration_frames = 20;
+static bool notebook_use_session_offset = true;
+static float notebook_train_baseline = 1.0f;
+static float notebook_train_mean = 0.0f;
+static float notebook_feature_ring[NOTEBOOK_MAX_EXTRACT_WINDOW][MAX_MODEL_FEATURES_PER_FRAME] = {{0}};
+static size_t notebook_ring_count = 0;
+static size_t notebook_ring_head = 0;
+static float notebook_session_mean_accum = 0.0f;
+static uint32_t notebook_session_mean_count = 0;
+static float notebook_variation_baseline_accum = 0.0f;
+static uint32_t notebook_variation_baseline_count = 0;
 static float last_prediction_confidence = 0.0f;
+static float last_prediction_probs[3] = {0.3333f, 0.3333f, 0.3333f};
 static float last_csi_mean = 0.0f;
 static float last_csi_max = 0.0f;
-static int pred_history[10] = {0};
-static int pred_history_idx = 0;
-static int pred_history_count = 0;
-static int current_majority_state = -1;
+static float smoothed_probs[3] = {0.3333f, 0.3333f, 0.3333f};
+static int stable_state = -1;
+static int pending_state = -1;
+static int pending_count = 0;
+static float confidence_ema = 0.0f;
+static float entropy_ema = 0.0f;
+static float feature_abs_ema = 0.0f;
+static int drift_alert_streak = 0;
+static int64_t last_drift_report_us = 0;
+static int64_t last_uncertain_publish_us = 0;
+static int64_t last_hold_publish_us = 0;
 static bool wifi_connected = false;
 static bool mqtt_connected = false;
 static bool model_download_in_progress = false;
@@ -92,11 +132,27 @@ static bool model_download_in_progress = false;
 // Status heartbeat task: send only when key state changes (or periodically)
 // to reduce heap allocations / wakeups.
 #define HEARTBEAT_INTERVAL_MS (60 * 1000) // 1 minute
+#define INFERENCE_QUEUE_DEPTH 16
+#define INFERENCE_DROP_LOG_INTERVAL 100
+#define CSI_LOG_MIN_INTERVAL_MS 1000
+#define STATE_SMOOTHING_ALPHA 0.85f
+#define STATE_ENTER_THRESHOLD 0.72f
+#define STATE_EXIT_THRESHOLD 0.55f
+#define STATE_SWITCH_CONSECUTIVE 3
+#define UNCERTAIN_CONFIDENCE_THRESHOLD 0.45f
+#define UNCERTAIN_PUBLISH_MIN_INTERVAL_MS 5000
+#define HOLD_STATE_PUBLISH_MIN_INTERVAL_MS 3000
+#define DRIFT_REPORT_INTERVAL_MS (30 * 1000)
+#define DRIFT_ALERT_CONSECUTIVE 3
+#define DRIFT_ENTROPY_THRESHOLD 0.72f
+#define DRIFT_CONFIDENCE_THRESHOLD 0.42f
+#define DRIFT_FEATURE_ABS_THRESHOLD 2.2f
 
 static TaskHandle_t status_task_handle = NULL;
 static bool last_published_mqtt_connected = false;
 static bool last_published_model_ready = false;
 static bool last_published_model_download_armed = false;
+static int64_t last_csi_log_us = 0;
 
 static void notify_status_task(void)
 {
@@ -110,11 +166,16 @@ typedef struct {
 } inference_sample_t;
 
 static QueueHandle_t inference_queue = NULL;
+static uint32_t inference_drop_count = 0;
 
 typedef struct {
     char *label;
     uint8_t sub_batch_idx;
     uint8_t total_sub_batches;
+    char session_id[32];
+    uint8_t *payload;
+    size_t payload_len;
+    uint32_t payload_crc32;
 } http_task_params_t;
 
 static esp_http_client_handle_t client = NULL;
@@ -201,6 +262,430 @@ static void publish_ack(const char *cmd)
     cJSON_Delete(obj);
 }
 
+static void publish_model_download_memory_error(const char *asset,
+                                                const char *reason,
+                                                const char *url,
+                                                size_t requested_bytes,
+                                                int attempt,
+                                                esp_err_t err)
+{
+    const char *asset_safe = asset ? asset : "unknown";
+    const char *reason_safe = reason ? reason : "unspecified";
+    const char *url_safe = url ? url : "";
+    const char *err_name = esp_err_to_name(err);
+    if (err_name == NULL) {
+        err_name = "UNKNOWN";
+    }
+
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+    char payload[512];
+    int len = snprintf(payload,
+                       sizeof(payload),
+                       "{\"event\":\"model_download_memory_error\","
+                       "\"asset\":\"%s\","
+                       "\"reason\":\"%s\","
+                       "\"attempt\":%d,"
+                       "\"requested_bytes\":%u,"
+                       "\"free_heap\":%" PRIu32 ","
+                       "\"largest_block\":%" PRIu32 ","
+                       "\"err\":%d,"
+                       "\"err_name\":\"%s\","
+                       "\"url\":\"%s\"}",
+                       asset_safe,
+                       reason_safe,
+                       attempt,
+                       (unsigned)requested_bytes,
+                       free_heap,
+                       largest_block,
+                       (int)err,
+                       err_name,
+                       url_safe);
+
+    ESP_LOGW(TAG,
+             "Model download memory error asset=%s reason=%s attempt=%d req=%u free=%" PRIu32 " largest=%" PRIu32 " err=%s",
+             asset_safe,
+             reason_safe,
+             attempt,
+             (unsigned)requested_bytes,
+             free_heap,
+             largest_block,
+             err_name);
+
+    if (len > 0 && len < (int)sizeof(payload)) {
+        publish_with_retry(ESP32_STATUS_TOPIC, payload, 1);
+    }
+}
+
+static void publish_model_download_incompatible(const char *reason, size_t input_elements)
+{
+    const char *reason_safe = reason ? reason : "unspecified";
+    char payload[256];
+    int len = snprintf(payload,
+                       sizeof(payload),
+                       "{\"event\":\"model_download_incompatible\","
+                       "\"reason\":\"%s\","
+                       "\"input_elements\":%u,"
+                       "\"feature_count\":%d}",
+                       reason_safe,
+                       (unsigned)input_elements,
+                       (int)model_features_per_frame);
+    if (len > 0 && len < (int)sizeof(payload)) {
+        publish_with_retry(ESP32_STATUS_TOPIC, payload, 1);
+    }
+}
+
+static void free_model_input_buffers(void)
+{
+    if (model_window_ring != NULL) {
+        free(model_window_ring);
+        model_window_ring = NULL;
+    }
+    if (model_input_scratch != NULL) {
+        free(model_input_scratch);
+        model_input_scratch = NULL;
+    }
+    model_input_elements = model_features_per_frame;
+    model_window_size = 1;
+    model_window_fill = 0;
+    model_window_head = 0;
+    notebook_ring_count = 0;
+    notebook_ring_head = 0;
+    notebook_session_mean_accum = 0.0f;
+    notebook_session_mean_count = 0;
+    notebook_variation_baseline_accum = 0.0f;
+    notebook_variation_baseline_count = 0;
+}
+
+static int raw_index_for_subcarrier(int sc)
+{
+    if (sc < MAX_LOWER || sc > MAX_UPPER || sc == DC_NULL) {
+        return -1;
+    }
+    if (sc < DC_NULL) {
+        return sc - MAX_LOWER;
+    }
+    return sc - MAX_LOWER - 1;
+}
+
+static bool is_supported_feature_layout(size_t feature_count)
+{
+    if (notebook_mode_enabled) {
+        return selected_subcarrier_count > 0 && feature_count == (selected_subcarrier_count + 1);
+    }
+
+    return feature_count == COMPACT_FEATURE_COUNT ||
+           feature_count == LEGACY_RAW55_FEATURE_COUNT ||
+           feature_count == LEGACY_RAW56_FEATURE_COUNT;
+}
+
+static float compute_subcarrier_slope(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
+                                      int sc_start,
+                                      int sc_end);
+
+static float notebook_avg_variation_from_ring(void)
+{
+    if (selected_subcarrier_count == 0 || notebook_ring_count == 0) {
+        return 0.0f;
+    }
+
+    size_t window_n = notebook_ring_count;
+    if (window_n > (size_t)notebook_extract_window_size) {
+        window_n = (size_t)notebook_extract_window_size;
+    }
+    if (window_n == 0) {
+        return 0.0f;
+    }
+
+    size_t start = (notebook_ring_head + NOTEBOOK_MAX_EXTRACT_WINDOW - window_n) % NOTEBOOK_MAX_EXTRACT_WINDOW;
+    float std_accum = 0.0f;
+
+    for (size_t feat = 0; feat < selected_subcarrier_count; feat++) {
+        float mean = 0.0f;
+        for (size_t w = 0; w < window_n; w++) {
+            size_t idx = (start + w) % NOTEBOOK_MAX_EXTRACT_WINDOW;
+            mean += notebook_feature_ring[idx][feat];
+        }
+        mean /= (float)window_n;
+
+        float var = 0.0f;
+        for (size_t w = 0; w < window_n; w++) {
+            size_t idx = (start + w) % NOTEBOOK_MAX_EXTRACT_WINDOW;
+            float d = notebook_feature_ring[idx][feat] - mean;
+            var += d * d;
+        }
+        var /= (float)window_n;
+        std_accum += sqrtf(var);
+    }
+
+    return std_accum / (float)selected_subcarrier_count;
+}
+
+static bool build_notebook_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
+                                          float *out_features,
+                                          size_t out_count)
+{
+    if (!notebook_mode_enabled ||
+        selected_subcarrier_count == 0 ||
+        out_count != (selected_subcarrier_count + 1) ||
+        out_features == NULL ||
+        raw_row == NULL) {
+        return false;
+    }
+
+    float frame_mean = 0.0f;
+    for (size_t i = 0; i < selected_subcarrier_count; i++) {
+        int raw_idx = selected_raw_indices[i];
+        if (raw_idx < 0 || raw_idx >= ACTIVE_SUBCARRIERS) {
+            return false;
+        }
+
+        float v = (float)raw_row[raw_idx];
+        out_features[i] = v;
+        frame_mean += v;
+        notebook_feature_ring[notebook_ring_head][i] = v;
+    }
+
+    notebook_ring_head = (notebook_ring_head + 1) % NOTEBOOK_MAX_EXTRACT_WINDOW;
+    if (notebook_ring_count < NOTEBOOK_MAX_EXTRACT_WINDOW) {
+        notebook_ring_count++;
+    }
+
+    frame_mean /= (float)selected_subcarrier_count;
+    notebook_session_mean_accum += frame_mean;
+    notebook_session_mean_count++;
+
+    float session_mean = notebook_train_mean;
+    if (notebook_session_mean_count > 0) {
+        session_mean = notebook_session_mean_accum / (float)notebook_session_mean_count;
+    }
+    float session_offset = notebook_use_session_offset ? (notebook_train_mean - session_mean) : 0.0f;
+
+    for (size_t i = 0; i < selected_subcarrier_count; i++) {
+        out_features[i] += session_offset;
+    }
+
+    float avg_variation = notebook_avg_variation_from_ring();
+    if (notebook_variation_baseline_count < (uint32_t)notebook_calibration_frames) {
+        notebook_variation_baseline_accum += avg_variation;
+        notebook_variation_baseline_count++;
+    }
+
+    float session_baseline = notebook_train_baseline;
+    if (notebook_variation_baseline_count > 0) {
+        session_baseline = notebook_variation_baseline_accum / (float)notebook_variation_baseline_count;
+    }
+    if (session_baseline <= FEATURE_EPSILON) {
+        session_baseline = 1.0f;
+    }
+
+    out_features[selected_subcarrier_count] = avg_variation / (session_baseline + FEATURE_EPSILON);
+    return true;
+}
+
+static bool build_legacy_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
+                                        float *out_features,
+                                        size_t out_count)
+{
+    if (raw_row == NULL || out_features == NULL || out_count == 0 || out_count > MAX_MODEL_FEATURES_PER_FRAME) {
+        return false;
+    }
+
+    // Legacy layout: SC_4..60 excluding SC_32 => 56 features.
+    if (out_count == LEGACY_RAW56_FEATURE_COUNT) {
+        for (size_t i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+            out_features[i] = (float)raw_row[i];
+        }
+        return true;
+    }
+
+    // Legacy layout: SC_4..59 excluding SC_32 => 55 features.
+    if (out_count == LEGACY_RAW55_FEATURE_COUNT) {
+        size_t out_idx = 0;
+        for (int sc = 4; sc <= 59; sc++) {
+            if (sc == DC_NULL) {
+                continue;
+            }
+            int idx = raw_index_for_subcarrier(sc);
+            if (idx < 0 || idx >= ACTIVE_SUBCARRIERS || out_idx >= out_count) {
+                return false;
+            }
+            out_features[out_idx++] = (float)raw_row[idx];
+        }
+        return out_idx == out_count;
+    }
+
+    // Compact layout must match training profile exactly.
+    if (out_count != COMPACT_FEATURE_COUNT) {
+        return false;
+    }
+
+    float compact[COMPACT_FEATURE_COUNT] = {0};
+    size_t compact_idx = 0;
+
+    // Keep SC_10..58 (excluding DC null), deprioritize SC_4..9 and SC_59..60.
+    for (int sc = 10; sc <= 58; sc++) {
+        if (sc == DC_NULL) {
+            continue;
+        }
+        int idx = raw_index_for_subcarrier(sc);
+        if (idx < 0 || idx >= ACTIVE_SUBCARRIERS) {
+            return false;
+        }
+        if (compact_idx >= COMPACT_FEATURE_COUNT) {
+            return false;
+        }
+        compact[compact_idx++] = (float)raw_row[idx];
+    }
+
+    float low_sum = 0.0f;
+    float high_sum = 0.0f;
+    int low_n = 0;
+    int high_n = 0;
+    for (int sc = 4; sc <= 26; sc++) {
+        int idx = raw_index_for_subcarrier(sc);
+        if (idx >= 0 && idx < ACTIVE_SUBCARRIERS) {
+            low_sum += (float)raw_row[idx];
+            low_n++;
+        }
+    }
+    for (int sc = 38; sc <= 60; sc++) {
+        int idx = raw_index_for_subcarrier(sc);
+        if (idx >= 0 && idx < ACTIVE_SUBCARRIERS) {
+            high_sum += (float)raw_row[idx];
+            high_n++;
+        }
+    }
+
+    float low_mean = (low_n > 0) ? (low_sum / (float)low_n) : 0.0f;
+    float high_mean = (high_n > 0) ? (high_sum / (float)high_n) : 0.0f;
+    float band_ratio = low_mean / fmaxf(high_mean, FEATURE_EPSILON);
+    float low_slope = compute_subcarrier_slope(raw_row, 10, 26);
+    float high_slope = compute_subcarrier_slope(raw_row, 38, 55);
+
+    if (compact_idx + 3 > COMPACT_FEATURE_COUNT) {
+        return false;
+    }
+    compact[compact_idx++] = band_ratio;
+    compact[compact_idx++] = low_slope;
+    compact[compact_idx++] = high_slope;
+
+    if (compact_idx != COMPACT_FEATURE_COUNT) {
+        return false;
+    }
+
+    memcpy(out_features, compact, COMPACT_FEATURE_COUNT * sizeof(float));
+    return true;
+}
+
+static float compute_subcarrier_slope(const uint8_t raw_row[ACTIVE_SUBCARRIERS], int sc_start, int sc_end)
+{
+    float sum_x = 0.0f;
+    float sum_y = 0.0f;
+    float sum_xx = 0.0f;
+    float sum_xy = 0.0f;
+    int n = 0;
+
+    for (int sc = sc_start; sc <= sc_end; sc++) {
+        if (sc == DC_NULL) {
+            continue;
+        }
+        int idx = raw_index_for_subcarrier(sc);
+        if (idx < 0 || idx >= ACTIVE_SUBCARRIERS) {
+            continue;
+        }
+
+        float x = (float)sc;
+        float y = (float)raw_row[idx];
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+        n++;
+    }
+
+    if (n < 2) {
+        return 0.0f;
+    }
+
+    float denom = ((float)n * sum_xx) - (sum_x * sum_x);
+    if (fabsf(denom) <= FEATURE_EPSILON) {
+        return 0.0f;
+    }
+
+    return ((((float)n) * sum_xy) - (sum_x * sum_y)) / denom;
+}
+
+static bool build_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
+                                 float *out_features,
+                                 size_t out_count)
+{
+    if (notebook_mode_enabled) {
+        return build_notebook_frame_features(raw_row, out_features, out_count);
+    }
+    return build_legacy_frame_features(raw_row, out_features, out_count);
+}
+
+static bool configure_model_input_buffers(size_t input_elements, int attempt)
+{
+    if (input_elements == 0) {
+        publish_model_download_incompatible("input_elements_zero", input_elements);
+        return false;
+    }
+
+    if (!is_supported_feature_layout(model_features_per_frame)) {
+        publish_model_download_incompatible("unsupported_feature_layout", input_elements);
+        return false;
+    }
+
+    if ((input_elements % model_features_per_frame) != 0) {
+        publish_model_download_incompatible("input_elements_not_multiple_of_features", input_elements);
+        return false;
+    }
+
+    size_t window_size = input_elements / model_features_per_frame;
+    if (window_size == 0) {
+        publish_model_download_incompatible("window_size_zero", input_elements);
+        return false;
+    }
+
+    free_model_input_buffers();
+
+    size_t bytes = input_elements * sizeof(float);
+    model_window_ring = (float *)malloc(bytes);
+    if (model_window_ring == NULL) {
+        publish_model_download_memory_error("model",
+                                            "window_ring_alloc_failed",
+                                            HTTP_MODEL_URI,
+                                            bytes,
+                                            attempt,
+                                            ESP_ERR_NO_MEM);
+        free_model_input_buffers();
+        return false;
+    }
+
+    model_input_scratch = (float *)malloc(bytes);
+    if (model_input_scratch == NULL) {
+        publish_model_download_memory_error("model",
+                                            "window_scratch_alloc_failed",
+                                            HTTP_MODEL_URI,
+                                            bytes,
+                                            attempt,
+                                            ESP_ERR_NO_MEM);
+        free_model_input_buffers();
+        return false;
+    }
+
+    memset(model_window_ring, 0, bytes);
+    memset(model_input_scratch, 0, bytes);
+    model_input_elements = input_elements;
+    model_window_size = window_size;
+    model_window_fill = 0;
+    model_window_head = 0;
+    return true;
+}
+
 static bool mqtt_topic_equals(esp_mqtt_event_handle_t event, const char *topic)
 {
     size_t expected_len = strlen(topic);
@@ -212,6 +697,12 @@ static void log_current_csi_row(const uint8_t *row, uint8_t count, int8_t rssi)
     if (row == NULL || count == 0) {
         return;
     }
+
+    int64_t now = esp_timer_get_time();
+    if ((now - last_csi_log_us) < ((int64_t)CSI_LOG_MIN_INTERVAL_MS * 1000)) {
+        return;
+    }
+    last_csi_log_us = now;
 
     // Only log a small slice of the buffer to keep serial output manageable.
     size_t show = count < 8 ? count : 8;
@@ -226,12 +717,129 @@ static void log_current_csi_row(const uint8_t *row, uint8_t count, int8_t rssi)
              show > 3 ? row[3] : 0);
 }
 
-static void reset_prediction_history(void)
+static void reset_state_machine(void)
 {
-    memset(pred_history, 0, sizeof(pred_history));
-    pred_history_idx = 0;
-    pred_history_count = 0;
-    current_majority_state = -1;
+    for (int i = 0; i < 3; i++) {
+        last_prediction_probs[i] = 0.3333f;
+        smoothed_probs[i] = 0.3333f;
+    }
+    last_prediction_confidence = 0.0f;
+    stable_state = -1;
+    pending_state = -1;
+    pending_count = 0;
+    confidence_ema = 0.0f;
+    entropy_ema = 0.0f;
+    feature_abs_ema = 0.0f;
+    drift_alert_streak = 0;
+    last_drift_report_us = 0;
+    last_uncertain_publish_us = 0;
+    last_hold_publish_us = 0;
+}
+
+static float normalized_entropy(const float probs[3])
+{
+    if (probs == NULL) {
+        return 1.0f;
+    }
+
+    float h = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float p = probs[i];
+        if (p < 1e-6f) {
+            continue;
+        }
+        h -= p * logf(p);
+    }
+    float max_h = logf(3.0f);
+    if (max_h <= 0.0f) {
+        return 1.0f;
+    }
+    float n = h / max_h;
+    if (n < 0.0f) {
+        return 0.0f;
+    }
+    if (n > 1.0f) {
+        return 1.0f;
+    }
+    return n;
+}
+
+static void publish_uncertain_event_if_needed(int pred, float confidence, float entropy)
+{
+    if (confidence >= UNCERTAIN_CONFIDENCE_THRESHOLD) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if ((now - last_uncertain_publish_us) < ((int64_t)UNCERTAIN_PUBLISH_MIN_INTERVAL_MS * 1000)) {
+        return;
+    }
+    last_uncertain_publish_us = now;
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+
+    cJSON_AddStringToObject(obj, "event", "inference_uncertain");
+    cJSON_AddNumberToObject(obj, "pred", pred);
+    cJSON_AddNumberToObject(obj, "confidence", confidence);
+    cJSON_AddNumberToObject(obj, "entropy", entropy);
+    cJSON_AddNumberToObject(obj, "confidence_ema", confidence_ema);
+    cJSON_AddNumberToObject(obj, "entropy_ema", entropy_ema);
+
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
+}
+
+static void publish_hold_event_if_needed(int stable_idx,
+                                         int candidate_idx,
+                                         float confidence,
+                                         float entropy,
+                                         const float probs[3])
+{
+    if (probs == NULL) {
+        return;
+    }
+    if (stable_idx < 0 || stable_idx > 2 || candidate_idx < 0 || candidate_idx > 2) {
+        return;
+    }
+    if (stable_idx == candidate_idx) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if ((now - last_hold_publish_us) < ((int64_t)HOLD_STATE_PUBLISH_MIN_INTERVAL_MS * 1000)) {
+        return;
+    }
+    last_hold_publish_us = now;
+
+    static const char *states[3] = {"door_open", "door_closed", "person_standing"};
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+
+    cJSON_AddStringToObject(obj, "event", "state_hold");
+    cJSON_AddStringToObject(obj, "held_state", states[stable_idx]);
+    cJSON_AddStringToObject(obj, "candidate_state", states[candidate_idx]);
+    cJSON_AddNumberToObject(obj, "confidence", confidence);
+    cJSON_AddNumberToObject(obj, "entropy", entropy);
+    cJSON_AddNumberToObject(obj, "p_open", probs[0]);
+    cJSON_AddNumberToObject(obj, "p_closed", probs[1]);
+    cJSON_AddNumberToObject(obj, "p_person", probs[2]);
+
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
 }
 
 static void log_resolved_host(const char *url)
@@ -291,7 +899,11 @@ static void log_resolved_host(const char *url)
     }
 }
 
-static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_len)
+static esp_err_t http_get_buffer(const char *url,
+                                 uint8_t **out_buf,
+                                 int *out_len,
+                                 const char *asset,
+                                 int attempt)
 {
     *out_buf = NULL;
     *out_len = 0;
@@ -303,6 +915,12 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
 
     esp_http_client_handle_t h = esp_http_client_init(&config);
     if (!h) {
+        publish_model_download_memory_error(asset,
+                                            "http_client_init_failed",
+                                            url,
+                                            0,
+                                            attempt,
+                                            ESP_ERR_NO_MEM);
         return ESP_FAIL;
     }
 
@@ -350,6 +968,12 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
                      url,
                      (unsigned)alloc_len,
                      (unsigned)largest_now);
+            publish_model_download_memory_error(asset,
+                                                "largest_block_too_small",
+                                                url,
+                                                alloc_len,
+                                                attempt,
+                                                ESP_ERR_NO_MEM);
             esp_http_client_close(h);
             esp_http_client_cleanup(h);
             return ESP_ERR_NO_MEM;
@@ -363,17 +987,37 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
                  (unsigned)alloc_len,
                  esp_get_free_heap_size(),
                  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        publish_model_download_memory_error(asset,
+                                            "malloc_failed",
+                                            url,
+                                            alloc_len,
+                                            attempt,
+                                            ESP_ERR_NO_MEM);
         esp_http_client_close(h);
         esp_http_client_cleanup(h);
         return ESP_ERR_NO_MEM;
     }
 
+    const bool known_content_len = (content_len > 0 && content_len < (int64_t)max_len);
     int total_read = 0;
     while (true) {
-        if ((size_t)(total_read + 1) >= alloc_len) {
+        size_t space_left = alloc_len - (size_t)total_read - 1;
+        if (space_left == 0) {
+            if (known_content_len) {
+                // For known Content-Length we allocated exact size (+NUL), so
+                // hitting capacity means we've read the full body.
+                break;
+            }
+
             size_t new_len = alloc_len * 2;
             if (new_len > max_len) {
                 ESP_LOGW(TAG, "http_get_buffer response too large for %s", url);
+                publish_model_download_memory_error(asset,
+                                                    "response_too_large",
+                                                    url,
+                                                    new_len,
+                                                    attempt,
+                                                    ESP_ERR_NO_MEM);
                 free(buf);
                 esp_http_client_close(h);
                 esp_http_client_cleanup(h);
@@ -388,6 +1032,12 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
                          url,
                          esp_get_free_heap_size(),
                          heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                publish_model_download_memory_error(asset,
+                                                    "realloc_failed",
+                                                    url,
+                                                    new_len,
+                                                    attempt,
+                                                    ESP_ERR_NO_MEM);
                 free(buf);
                 esp_http_client_close(h);
                 esp_http_client_cleanup(h);
@@ -396,11 +1046,23 @@ static esp_err_t http_get_buffer(const char *url, uint8_t **out_buf, int *out_le
 
             buf = grown;
             alloc_len = new_len;
+            space_left = alloc_len - (size_t)total_read - 1;
+        }
+
+        size_t read_cap = space_left;
+        if (known_content_len) {
+            size_t remaining = (size_t)content_len - (size_t)total_read;
+            if (remaining == 0) {
+                break;
+            }
+            if (read_cap > remaining) {
+                read_cap = remaining;
+            }
         }
 
         int read_len = esp_http_client_read(h,
                                             (char *)buf + total_read,
-                                            (int)(alloc_len - (size_t)total_read - 1));
+                                            (int)read_cap);
         if (read_len < 0) {
             ESP_LOGW(TAG, "http_get_buffer read failed (len=%d) for %s", read_len, url);
             free(buf);
@@ -447,18 +1109,26 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
         return false;
     }
 
-    for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+    for (int i = 0; i < MAX_MODEL_FEATURES_PER_FRAME; i++) {
         mean_vals[i] = 0.0f;
         std_vals[i] = 1.0f;
     }
 
     int mean_sz = cJSON_GetArraySize(mean_arr);
     int std_sz = cJSON_GetArraySize(std_arr);
-    int lim = mean_sz < std_sz ? mean_sz : std_sz;
-    if (lim > ACTIVE_SUBCARRIERS) {
-        lim = ACTIVE_SUBCARRIERS;
+    if (mean_sz <= 0 || std_sz <= 0 || mean_sz != std_sz) {
+        cJSON_Delete(root);
+        ESP_LOGE(TAG, "scaler params mean/std mismatch mean=%d std=%d", mean_sz, std_sz);
+        return false;
     }
 
+    if (mean_sz > MAX_MODEL_FEATURES_PER_FRAME) {
+        cJSON_Delete(root);
+        ESP_LOGE(TAG, "scaler feature count too large: %d", mean_sz);
+        return false;
+    }
+
+    int lim = mean_sz;
     for (int i = 0; i < lim; i++) {
         cJSON *jm = cJSON_GetArrayItem(mean_arr, i);
         cJSON *js = cJSON_GetArrayItem(std_arr, i);
@@ -470,77 +1140,173 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
         }
     }
 
+    notebook_mode_enabled = false;
+    selected_subcarrier_count = 0;
+    notebook_extract_window_size = 5;
+    notebook_calibration_frames = 20;
+    notebook_use_session_offset = true;
+    notebook_train_baseline = 1.0f;
+    notebook_train_mean = 0.0f;
+
+    cJSON *selected_sc = cJSON_GetObjectItem(root, "selected_subcarriers");
+    if (cJSON_IsArray(selected_sc)) {
+        int sc_count = cJSON_GetArraySize(selected_sc);
+        if (sc_count > 0 && sc_count < MAX_MODEL_FEATURES_PER_FRAME && (sc_count + 1) == lim) {
+            bool valid = true;
+            for (int i = 0; i < sc_count; i++) {
+                cJSON *jsc = cJSON_GetArrayItem(selected_sc, i);
+                if (!cJSON_IsNumber(jsc)) {
+                    valid = false;
+                    break;
+                }
+
+                int sc = (int)jsc->valuedouble;
+                int raw_idx = raw_index_for_subcarrier(sc);
+                if (raw_idx < 0 || raw_idx >= ACTIVE_SUBCARRIERS) {
+                    valid = false;
+                    break;
+                }
+
+                selected_subcarriers[i] = sc;
+                selected_raw_indices[i] = raw_idx;
+            }
+
+            if (valid) {
+                selected_subcarrier_count = (size_t)sc_count;
+                notebook_mode_enabled = true;
+
+                cJSON *notebook_cfg = cJSON_GetObjectItem(root, "notebook_alignment");
+                if (cJSON_IsObject(notebook_cfg)) {
+                    cJSON *j_window = cJSON_GetObjectItem(notebook_cfg, "extract_window_size");
+                    if (cJSON_IsNumber(j_window)) {
+                        int w = (int)j_window->valuedouble;
+                        if (w < 1) {
+                            w = 1;
+                        }
+                        if (w > NOTEBOOK_MAX_EXTRACT_WINDOW) {
+                            w = NOTEBOOK_MAX_EXTRACT_WINDOW;
+                        }
+                        notebook_extract_window_size = w;
+                    }
+
+                    cJSON *j_cal_frames = cJSON_GetObjectItem(notebook_cfg, "calibration_frames");
+                    if (cJSON_IsNumber(j_cal_frames)) {
+                        int cf = (int)j_cal_frames->valuedouble;
+                        if (cf < 1) {
+                            cf = 1;
+                        }
+                        notebook_calibration_frames = cf;
+                    }
+
+                    cJSON *j_baseline = cJSON_GetObjectItem(notebook_cfg, "train_baseline");
+                    if (cJSON_IsNumber(j_baseline)) {
+                        notebook_train_baseline = (float)j_baseline->valuedouble;
+                    }
+                    if (notebook_train_baseline <= FEATURE_EPSILON) {
+                        notebook_train_baseline = 1.0f;
+                    }
+
+                    cJSON *j_train_mean = cJSON_GetObjectItem(notebook_cfg, "train_mean");
+                    if (cJSON_IsNumber(j_train_mean)) {
+                        notebook_train_mean = (float)j_train_mean->valuedouble;
+                    }
+
+                    cJSON *j_use_offset = cJSON_GetObjectItem(notebook_cfg, "use_session_offset");
+                    if (cJSON_IsBool(j_use_offset)) {
+                        notebook_use_session_offset = cJSON_IsTrue(j_use_offset);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!notebook_mode_enabled &&
+        lim != COMPACT_FEATURE_COUNT &&
+        lim != LEGACY_RAW55_FEATURE_COUNT &&
+        lim != LEGACY_RAW56_FEATURE_COUNT) {
+        cJSON_Delete(root);
+        ESP_LOGE(TAG, "unsupported scaler feature layout: %d", lim);
+        return false;
+    }
+
+    model_features_per_frame = (size_t)lim;
+    model_input_elements = model_features_per_frame;
+    notebook_ring_count = 0;
+    notebook_ring_head = 0;
+    notebook_session_mean_accum = 0.0f;
+    notebook_session_mean_count = 0;
+    notebook_variation_baseline_accum = 0.0f;
+    notebook_variation_baseline_count = 0;
+
+    ESP_LOGI(TAG,
+             "Loaded scaler: feature_count=%d mode=%s selected_subcarriers=%u extract_window=%d calib_frames=%d",
+             lim,
+             notebook_mode_enabled ? "notebook" : "legacy",
+             (unsigned)selected_subcarrier_count,
+             notebook_extract_window_size,
+             notebook_calibration_frames);
+
     cJSON_Delete(root);
     return true;
 }
 
-static int run_model(const float *input, size_t len)
+static int run_model(const float *input, size_t len, float out_probs[3], float *out_confidence)
 {
     if (!model_ready || !input || len == 0) {
         return -1;
     }
 
     float confidence = 0.0f;
-    int pred = tflm_predict_with_confidence(input, len, &confidence);
+    float probs[3] = {0.0f, 0.0f, 0.0f};
+    int pred = tflm_predict_with_probs(input, len, probs, 3, &confidence);
     if (pred < 0 || pred > 2) {
         ESP_LOGW(TAG, "tflm_predict failed: %s", tflm_last_error());
         return -1;
     }
 
-    last_prediction_confidence = confidence;
-    return pred;
-}
-
-static void update_majority_and_notify(int pred)
-{
-    if (pred < 0 || pred > 2) {
-        return;
-    }
-
-    pred_history[pred_history_idx] = pred;
-    pred_history_idx = (pred_history_idx + 1) % 10;
-    if (pred_history_count < 10) {
-        pred_history_count++;
-    }
-
-    if (pred_history_count < 10) {
-        return;
-    }
-
-    int counts[3] = {0, 0, 0};
-    for (int i = 0; i < 10; i++) {
-        int v = pred_history[i];
-        if (v >= 0 && v <= 2) {
-            counts[v]++;
+    for (int i = 0; i < 3; i++) {
+        last_prediction_probs[i] = probs[i];
+        if (out_probs != NULL) {
+            out_probs[i] = probs[i];
         }
     }
 
-    int maj = 0;
-    if (counts[1] > counts[maj]) {
-        maj = 1;
+    last_prediction_confidence = confidence;
+    if (out_confidence != NULL) {
+        *out_confidence = confidence;
     }
-    if (counts[2] > counts[maj]) {
-        maj = 2;
-    }
+    return pred;
+}
 
-    if (maj == current_majority_state) {
+static void publish_state_change(int state_idx)
+{
+    if (state_idx < 0 || state_idx > 2) {
         return;
     }
 
-    // IMPORTANT: align with train_model.py label mapping.
     static const char *states[3] = {"door_open", "door_closed", "person_standing"};
 
-    current_majority_state = maj;
-
-    ESP_LOGI(TAG, "state_change => %s (confidence=%.2f)", states[maj], last_prediction_confidence);
+    ESP_LOGI(TAG,
+             "state_change => %s (conf=%.2f, smooth=[%.2f, %.2f, %.2f])",
+             states[state_idx],
+             last_prediction_confidence,
+             smoothed_probs[0],
+             smoothed_probs[1],
+             smoothed_probs[2]);
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
         return;
     }
     cJSON_AddStringToObject(obj, "event", "state_change");
-    cJSON_AddStringToObject(obj, "state", states[maj]);
+    cJSON_AddStringToObject(obj, "state", states[state_idx]);
     cJSON_AddNumberToObject(obj, "confidence", last_prediction_confidence);
+    cJSON_AddNumberToObject(obj, "p_open", last_prediction_probs[0]);
+    cJSON_AddNumberToObject(obj, "p_closed", last_prediction_probs[1]);
+    cJSON_AddNumberToObject(obj, "p_person", last_prediction_probs[2]);
+    cJSON_AddNumberToObject(obj, "smooth_open", smoothed_probs[0]);
+    cJSON_AddNumberToObject(obj, "smooth_closed", smoothed_probs[1]);
+    cJSON_AddNumberToObject(obj, "smooth_person", smoothed_probs[2]);
 
     char *json_str = cJSON_PrintUnformatted(obj);
     if (json_str) {
@@ -548,6 +1314,151 @@ static void update_majority_and_notify(int pred)
         free(json_str);
     }
     cJSON_Delete(obj);
+}
+
+static void maybe_publish_drift_event(int pred)
+{
+    int64_t now = esp_timer_get_time();
+    bool periodic_due = (last_drift_report_us == 0) ||
+                        ((now - last_drift_report_us) >= ((int64_t)DRIFT_REPORT_INTERVAL_MS * 1000));
+
+    bool drift_alert = ((entropy_ema >= DRIFT_ENTROPY_THRESHOLD) &&
+                        (confidence_ema <= DRIFT_CONFIDENCE_THRESHOLD)) ||
+                       (feature_abs_ema >= DRIFT_FEATURE_ABS_THRESHOLD);
+    if (drift_alert) {
+        drift_alert_streak++;
+    } else if (drift_alert_streak > 0) {
+        drift_alert_streak--;
+    }
+
+    bool alert_due = drift_alert && (drift_alert_streak >= DRIFT_ALERT_CONSECUTIVE);
+    if (!periodic_due && !alert_due) {
+        return;
+    }
+
+    last_drift_report_us = now;
+    const char *event_name = alert_due ? "drift_alert" : "drift_report";
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+    cJSON_AddStringToObject(obj, "event", event_name);
+    cJSON_AddNumberToObject(obj, "pred", pred);
+    cJSON_AddNumberToObject(obj, "stable_state", stable_state);
+    cJSON_AddNumberToObject(obj, "confidence_ema", confidence_ema);
+    cJSON_AddNumberToObject(obj, "entropy_ema", entropy_ema);
+    cJSON_AddNumberToObject(obj, "feature_abs_ema", feature_abs_ema);
+    cJSON_AddBoolToObject(obj, "calibration_drift_suspected", drift_alert ? 1 : 0);
+
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
+
+    if (alert_due) {
+        drift_alert_streak = 0;
+    }
+}
+
+static void update_state_machine_and_notify(int pred, const float probs[3], float confidence, float feature_abs_mean)
+{
+    if (pred < 0 || pred > 2 || probs == NULL) {
+        return;
+    }
+
+    float entropy = normalized_entropy(probs);
+    const float ema_alpha = 0.90f;
+    confidence_ema = (confidence_ema == 0.0f) ? confidence : (ema_alpha * confidence_ema + (1.0f - ema_alpha) * confidence);
+    entropy_ema = (entropy_ema == 0.0f) ? entropy : (ema_alpha * entropy_ema + (1.0f - ema_alpha) * entropy);
+    feature_abs_ema = (feature_abs_ema == 0.0f) ? feature_abs_mean : (ema_alpha * feature_abs_ema + (1.0f - ema_alpha) * feature_abs_mean);
+
+    float sum_smooth = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        smoothed_probs[i] = (STATE_SMOOTHING_ALPHA * smoothed_probs[i]) + ((1.0f - STATE_SMOOTHING_ALPHA) * probs[i]);
+        if (smoothed_probs[i] < 0.0f) {
+            smoothed_probs[i] = 0.0f;
+        }
+        sum_smooth += smoothed_probs[i];
+    }
+    if (sum_smooth > 0.0f) {
+        for (int i = 0; i < 3; i++) {
+            smoothed_probs[i] /= sum_smooth;
+        }
+    }
+
+    int best_idx = 0;
+    if (smoothed_probs[1] > smoothed_probs[best_idx]) {
+        best_idx = 1;
+    }
+    if (smoothed_probs[2] > smoothed_probs[best_idx]) {
+        best_idx = 2;
+    }
+
+    float best_score = smoothed_probs[best_idx];
+    float stable_score = (stable_state >= 0 && stable_state < 3) ? smoothed_probs[stable_state] : 0.0f;
+    bool uncertain = confidence < UNCERTAIN_CONFIDENCE_THRESHOLD;
+
+    publish_uncertain_event_if_needed(pred, confidence, entropy);
+    if (uncertain && stable_state >= 0 && best_idx != stable_state) {
+        publish_hold_event_if_needed(stable_state, best_idx, confidence, entropy, probs);
+    }
+
+    if (stable_state < 0) {
+        if (!uncertain && best_score >= STATE_ENTER_THRESHOLD) {
+            if (pending_state == best_idx) {
+                pending_count++;
+            } else {
+                pending_state = best_idx;
+                pending_count = 1;
+            }
+            if (pending_count >= STATE_SWITCH_CONSECUTIVE) {
+                stable_state = best_idx;
+                pending_state = -1;
+                pending_count = 0;
+                publish_state_change(stable_state);
+            }
+        } else {
+            pending_state = -1;
+            pending_count = 0;
+        }
+        maybe_publish_drift_event(pred);
+        return;
+    }
+
+    if (best_idx == stable_state) {
+        pending_state = -1;
+        pending_count = 0;
+        maybe_publish_drift_event(pred);
+        return;
+    }
+
+    bool switch_candidate = (!uncertain) &&
+                            (best_score >= STATE_ENTER_THRESHOLD) &&
+                            (stable_score <= STATE_EXIT_THRESHOLD);
+
+    if (switch_candidate) {
+        if (pending_state == best_idx) {
+            pending_count++;
+        } else {
+            pending_state = best_idx;
+            pending_count = 1;
+        }
+
+        if (pending_count >= STATE_SWITCH_CONSECUTIVE) {
+            stable_state = best_idx;
+            pending_state = -1;
+            pending_count = 0;
+            publish_state_change(stable_state);
+        }
+    } else {
+        pending_state = -1;
+        pending_count = 0;
+    }
+
+    maybe_publish_drift_event(pred);
 }
 
 static void vInferenceTask(void *pvParameters)
@@ -565,17 +1476,56 @@ static void vInferenceTask(void *pvParameters)
                 continue;
             }
 
-            float model_input[ACTIVE_SUBCARRIERS];
-            for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+            if (model_window_ring == NULL ||
+                model_input_scratch == NULL ||
+                model_window_size == 0 ||
+                model_input_elements == 0 ||
+                model_features_per_frame == 0 ||
+                model_features_per_frame > MAX_MODEL_FEATURES_PER_FRAME) {
+                continue;
+            }
+
+            float frame_input[MAX_MODEL_FEATURES_PER_FRAME];
+            if (!build_frame_features(sample.normalized, frame_input, model_features_per_frame)) {
+                continue;
+            }
+
+            float feature_abs_mean = 0.0f;
+            for (size_t i = 0; i < model_features_per_frame; i++) {
                 float sigma = std_vals[i];
                 if (sigma == 0.0f) {
                     sigma = 1.0f;
                 }
-                model_input[i] = (((float)sample.normalized[i]) - mean_vals[i]) / sigma;
+                frame_input[i] = (frame_input[i] - mean_vals[i]) / sigma;
+                feature_abs_mean += fabsf(frame_input[i]);
+            }
+            feature_abs_mean /= (float)model_features_per_frame;
+
+            size_t write_offset = model_window_head * model_features_per_frame;
+            memcpy(model_window_ring + write_offset,
+                   frame_input,
+                   model_features_per_frame * sizeof(float));
+
+            model_window_head = (model_window_head + 1) % model_window_size;
+            if (model_window_fill < model_window_size) {
+                model_window_fill++;
             }
 
-            int pred = run_model(model_input, ACTIVE_SUBCARRIERS);
-            update_majority_and_notify(pred);
+            if (model_window_fill < model_window_size) {
+                continue;
+            }
+
+            for (size_t w = 0; w < model_window_size; w++) {
+                size_t frame_idx = (model_window_head + w) % model_window_size;
+                                memcpy(model_input_scratch + (w * model_features_per_frame),
+                                             model_window_ring + (frame_idx * model_features_per_frame),
+                                             model_features_per_frame * sizeof(float));
+            }
+
+            float probs[3] = {0.0f, 0.0f, 0.0f};
+            float confidence = 0.0f;
+            int pred = run_model(model_input_scratch, model_input_elements, probs, &confidence);
+            update_state_machine_and_notify(pred, probs, confidence, feature_abs_mean);
 
             // Yield to keep the networking tasks responsive.
             taskYIELD();
@@ -592,6 +1542,7 @@ static void download_model_and_params_task(void *pvParameters)
     if (model_buffer) {
         free(model_buffer);
         model_buffer = NULL;
+        free_model_input_buffers();
         model_size = 0;
         model_ready = false;
         tflm_reset();
@@ -619,14 +1570,14 @@ static void download_model_and_params_task(void *pvParameters)
 
         // Download and parse scaler first, then free it before model download
         // to lower peak RAM pressure.
-        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len);
+        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len, "scaler", attempt);
         if (e2 == ESP_OK) {
             scaler_ok = load_scaler_params(downloaded_params, params_len);
             free(downloaded_params);
             downloaded_params = NULL;
         }
 
-        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len);
+        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len, "model", attempt);
 
         ESP_LOGI(TAG,
                  "Download results: model err=%s len=%d, params err=%s len=%d scaler_ok=%d largest_block=%u",
@@ -644,8 +1595,23 @@ static void download_model_and_params_task(void *pvParameters)
             }
             if (!model_ok) {
                 ESP_LOGW(TAG, "TFLM model load failed (len=%d): %s", model_len, tflm_last_error());
+                publish_model_download_incompatible(tflm_last_error(), 0);
             }
-            if (scaler_ok && model_ok) {
+            size_t input_elements = tflm_input_element_count();
+            bool input_buffers_ok = false;
+            if (model_ok) {
+                input_buffers_ok = configure_model_input_buffers(input_elements, attempt);
+                if (!input_buffers_ok) {
+                    ESP_LOGW(TAG,
+                             "Model input buffer configuration failed (elements=%u features_per_frame=%u remainder=%u)",
+                             (unsigned)input_elements,
+                             (unsigned)model_features_per_frame,
+                             (unsigned)(input_elements % model_features_per_frame));
+                    tflm_reset();
+                    model_ok = false;
+                }
+            }
+            if (scaler_ok && model_ok && input_buffers_ok) {
                 if (model_buffer) {
                     free(model_buffer);
                 }
@@ -653,12 +1619,17 @@ static void download_model_and_params_task(void *pvParameters)
                 model_size = (size_t)model_len;
                 model_ready = true;
                 notify_status_task();
-                reset_prediction_history();
+                publish_status("model_ready", true, true);  // ensure dashboard sees model load immediately
+                reset_state_machine();
+                model_window_fill = 0;
+                model_window_head = 0;
 
                 cJSON *obj = cJSON_CreateObject();
                 if (obj) {
                     cJSON_AddStringToObject(obj, "event", "model_ready");
                     cJSON_AddNumberToObject(obj, "bytes", (double)model_size);
+                    cJSON_AddNumberToObject(obj, "input_elements", (double)model_input_elements);
+                    cJSON_AddNumberToObject(obj, "window_size", (double)model_window_size);
                     char *json_str = cJSON_PrintUnformatted(obj);
                     if (json_str) {
                         publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
@@ -689,6 +1660,7 @@ static void download_model_and_params_task(void *pvParameters)
     }
 
     model_ready = false;
+    free_model_input_buffers();
     notify_status_task();
     tflm_reset();
 
@@ -707,146 +1679,207 @@ static void download_model_and_params_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+static void free_http_task_params(http_task_params_t *params)
+{
+    if (params == NULL) {
+        return;
+    }
+    if (params->payload != NULL) {
+        free(params->payload);
+        params->payload = NULL;
+    }
+    if (params->label != NULL) {
+        free(params->label);
+        params->label = NULL;
+    }
+    free(params);
+}
+
+static bool is_http_success_status(int status_code)
+{
+    return status_code >= 200 && status_code < 300;
+}
+
+static bool should_retry_upload_attempt(esp_err_t err, int status_code)
+{
+    if (err != ESP_OK) {
+        return true;
+    }
+
+    // Explicitly retry CRC mismatch responses to recover from transient corruption.
+    if (status_code == 422) {
+        return true;
+    }
+
+    if (status_code == 408 || status_code == 429) {
+        return true;
+    }
+
+    if (status_code >= 500) {
+        return true;
+    }
+
+    return false;
+}
+
 static void send_batch_http_task(void *pvParameters)
 {
-    if (pvParameters == NULL || mqtt_client == NULL) {
-        ESP_LOGE(TAG, "HTTP task received NULL parameters or uninitialized MQTT client");
+    if (pvParameters == NULL) {
+        ESP_LOGE(TAG, "HTTP task received NULL parameters");
         vTaskDelete(NULL);
         return;
     }
 
     http_task_params_t *params = (http_task_params_t *)pvParameters;
-
-    esp_http_client_config_t config = {};
-    config.url = HTTP_UPLOAD_URI;
-    config.method = HTTP_METHOD_POST;
-
-    // Initialize HTTP client on first use, then reuse for subsequent batches
-    if (client == NULL) {
-        client = esp_http_client_init(&config);
-    }
-
-    // Tell server the label for this batch in HTTP headers
-    esp_http_client_set_header(client, "X-Room-State", params->label);
-    esp_http_client_set_header(client, "X-ESP32-ID", CONFIG_CSI_NODE_ID);
-    if (current_session_id[0] != '\0') {
-        esp_http_client_set_header(client, "X-Session-ID", current_session_id);
+    if (mqtt_client == NULL || params->label == NULL || params->payload == NULL || params->payload_len == 0) {
+        ESP_LOGE(TAG, "HTTP task invalid state (mqtt=%p label=%p payload=%p len=%u)",
+                 (void *)mqtt_client,
+                 (void *)params->label,
+                 (void *)params->payload,
+                 (unsigned)params->payload_len);
+        free_http_task_params(params);
+        vTaskDelete(NULL);
+        return;
     }
 
     // Progress tracking headers for server-side assembly of batches
     char sub_batch_str[6];
     snprintf(sub_batch_str, sizeof(sub_batch_str), "%d", params->sub_batch_idx);
-    esp_http_client_set_header(client, "X-Sub-Batch-Index", sub_batch_str);
 
     char total_batches_str[6];
     snprintf(total_batches_str, sizeof(total_batches_str), "%d", params->total_sub_batches);
-    esp_http_client_set_header(client, "X-Total-Sub-Batches", total_batches_str);
 
-    // Set header to tell server this is binary data
-    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
-    esp_http_client_set_post_field(client, (const char *)csi_buffer, sizeof(csi_buffer));
-
-    // Compute CRC32 of payload for integrity check
-    uint32_t crc32_val = esp_crc32_le(0, (const uint8_t *)csi_buffer, sizeof(csi_buffer));
     // CRC32 is 32 bits; formatted as 8 hex digits plus null terminator.
-    // Buffer size 9 is sufficient for any 32-bit hex string.
     char crc32_str[9];
-    snprintf(crc32_str, sizeof(crc32_str), "%08" PRIx32, crc32_val);
-    esp_http_client_set_header(client, "X-CRC32", crc32_str);
+    snprintf(crc32_str, sizeof(crc32_str), "%08" PRIx32, params->payload_crc32);
 
     // Idempotency key: session + sub-batch index (content changes are caught by CRC)
-    // Expected session_id format is a timestamp (14 chars) and sub_batch_idx is small.
+    // Use the per-task session snapshot so retries cannot drift if globals change.
     char idem_key[IDEMPOTENCY_KEY_MAX_LEN];
-    snprintf(idem_key, sizeof(idem_key), "%s_%d", current_session_id, params->sub_batch_idx);
-    esp_http_client_set_header(client, "X-Idempotency-Key", idem_key);
+    const char *session_for_headers = (params->session_id[0] != '\0') ? params->session_id : "nosession";
+    snprintf(idem_key, sizeof(idem_key), "%s_%d", session_for_headers, params->sub_batch_idx);
 
-    uint32_t heap_before = esp_get_free_heap_size();
-    uint32_t min_heap_before = esp_get_minimum_free_heap_size();
+    const int max_attempts = 4; // initial + 3 retries
+    bool upload_success = false;
+    esp_err_t last_err = ESP_FAIL;
+    int last_http_status = -1;
 
-    esp_err_t err = esp_http_client_perform(client);
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        esp_http_client_config_t config = {};
+        config.url = HTTP_UPLOAD_URI;
+        config.method = HTTP_METHOD_POST;
 
-    uint32_t heap_after = esp_get_free_heap_size();
-    uint32_t min_heap_after = esp_get_minimum_free_heap_size();
+        esp_http_client_handle_t http_client = esp_http_client_init(&config);
+        if (http_client == NULL) {
+            ESP_LOGE(TAG, "Failed to init HTTP client for upload attempt %d/%d", attempt, max_attempts);
+            last_err = ESP_FAIL;
+            last_http_status = -1;
+            break;
+        }
 
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Batch uploaded successfully (%d/%d) - CSI mean=%.1f max=%.1f", params->sub_batch_idx + 1, params->total_sub_batches, last_csi_mean, last_csi_max);
-        ESP_LOGW("MEM_STATS", "HTTP call stats: used %lu bytes (peak %lu during call)",
-                 (unsigned long)(heap_before - heap_after),
-                 (unsigned long)(min_heap_before - min_heap_after));
-        char progress[128];
-        snprintf(progress, sizeof(progress),
-                 "{\"event\":\"upload\",\"sub\":%d,\"total\":%d,\"csi_mean\":%.1f,\"csi_max\":%.1f}",
-                 params->sub_batch_idx + 1, params->total_sub_batches, last_csi_mean, last_csi_max);
-        publish_with_retry(ESP32_STATUS_TOPIC, progress, 1);
+        // Tell server the label and metadata for this batch in HTTP headers
+        esp_http_client_set_header(http_client, "X-Room-State", params->label);
+        esp_http_client_set_header(http_client, "X-ESP32-ID", CONFIG_CSI_NODE_ID);
+        if (params->session_id[0] != '\0') {
+            esp_http_client_set_header(http_client, "X-Session-ID", params->session_id);
+        }
+        esp_http_client_set_header(http_client, "X-Sub-Batch-Index", sub_batch_str);
+        esp_http_client_set_header(http_client, "X-Total-Sub-Batches", total_batches_str);
+        esp_http_client_set_header(http_client, "Content-Type", "application/octet-stream");
+        esp_http_client_set_header(http_client, "X-CRC32", crc32_str);
+        esp_http_client_set_header(http_client, "X-Idempotency-Key", idem_key);
+        esp_http_client_set_post_field(http_client, (const char *)params->payload, (int)params->payload_len);
 
-        // Reset client after a successful upload so we start fresh next time.
-        esp_http_client_cleanup(client);
-        client = NULL;
-    } else {
-        ESP_LOGE(TAG, "HTTP upload failed (%s) for sub-batch %d", esp_err_to_name(err), params->sub_batch_idx + 1);
-        char failmsg[128];
+        uint32_t heap_before = esp_get_free_heap_size();
+        uint32_t min_heap_before = esp_get_minimum_free_heap_size();
+
+        last_err = esp_http_client_perform(http_client);
+        last_http_status = (last_err == ESP_OK) ? esp_http_client_get_status_code(http_client) : -1;
+
+        uint32_t heap_after = esp_get_free_heap_size();
+        uint32_t min_heap_after = esp_get_minimum_free_heap_size();
+
+        if (last_err == ESP_OK && is_http_success_status(last_http_status)) {
+            ESP_LOGI(TAG,
+                     "Batch uploaded successfully (%d/%d), HTTP %d (attempt %d/%d) - CSI mean=%.1f max=%.1f",
+                     params->sub_batch_idx + 1,
+                     params->total_sub_batches,
+                     last_http_status,
+                     attempt,
+                     max_attempts,
+                     last_csi_mean,
+                     last_csi_max);
+            ESP_LOGW("MEM_STATS", "HTTP call stats: used %lu bytes (peak %lu during call)",
+                     (unsigned long)(heap_before - heap_after),
+                     (unsigned long)(min_heap_before - min_heap_after));
+
+            char progress[128];
+            snprintf(progress, sizeof(progress),
+                     "{\"event\":\"upload\",\"sub\":%d,\"total\":%d,\"csi_mean\":%.1f,\"csi_max\":%.1f}",
+                     params->sub_batch_idx + 1,
+                     params->total_sub_batches,
+                     last_csi_mean,
+                     last_csi_max);
+            publish_with_retry(ESP32_STATUS_TOPIC, progress, 1);
+
+            upload_success = true;
+            esp_http_client_cleanup(http_client);
+            break;
+        }
+
+        bool retryable = should_retry_upload_attempt(last_err, last_http_status);
+        if (last_http_status == 422) {
+            ESP_LOGW(TAG,
+                     "HTTP 422 (CRC mismatch) for sub-batch %d on attempt %d/%d; retrying",
+                     params->sub_batch_idx + 1,
+                     attempt,
+                     max_attempts);
+        } else {
+            ESP_LOGW(TAG,
+                     "HTTP upload failed for sub-batch %d (attempt %d/%d): err=%s status=%d retryable=%d",
+                     params->sub_batch_idx + 1,
+                     attempt,
+                     max_attempts,
+                     esp_err_to_name(last_err),
+                     last_http_status,
+                     retryable ? 1 : 0);
+        }
+
+        char failmsg[192];
         snprintf(failmsg, sizeof(failmsg),
-                 "{\"event\":\"upload_failed\",\"sub\":%d,\"err\":%d}",
-                 params->sub_batch_idx + 1, err);
+                 "{\"event\":\"upload_failed\",\"sub\":%d,\"attempt\":%d,\"status\":%d,\"err\":%d}",
+                 params->sub_batch_idx + 1,
+                 attempt,
+                 last_http_status,
+                 last_err);
         publish_with_retry(ESP32_STATUS_TOPIC, failmsg, 1);
 
-        // Cleanup and retry with a fresh connection
-        esp_http_client_cleanup(client);
-        client = NULL;
+        esp_http_client_cleanup(http_client);
 
-        int retries = 0;
-        while (retries < 3 && err != ESP_OK) {
-            // Recreate client for each retry to avoid stale/closed socket state
-            esp_http_client_config_t retry_cfg = {};
-            retry_cfg.url = HTTP_UPLOAD_URI;
-            retry_cfg.method = HTTP_METHOD_POST;
-            client = esp_http_client_init(&retry_cfg);
-            if (!client) {
-                ESP_LOGE(TAG, "Failed to reinit HTTP client for retry %d", retries + 1);
-                break;
-            }
-            err = esp_http_client_set_header(client, "X-Room-State", params->label);
-            esp_http_client_set_header(client, "X-ESP32-ID", CONFIG_CSI_NODE_ID);
-            if (current_session_id[0] != '\0') {
-                esp_http_client_set_header(client, "X-Session-ID", current_session_id);
-            }
-            char sub_batch_str[6];
-            snprintf(sub_batch_str, sizeof(sub_batch_str), "%d", params->sub_batch_idx);
-            esp_http_client_set_header(client, "X-Sub-Batch-Index", sub_batch_str);
-            char total_batches_str[6];
-            snprintf(total_batches_str, sizeof(total_batches_str), "%d", params->total_sub_batches);
-            esp_http_client_set_header(client, "X-Total-Sub-Batches", total_batches_str);
-            esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
-            esp_http_client_set_post_field(client, (const char *)csi_buffer, sizeof(csi_buffer));
-            esp_http_client_set_header(client, "X-CRC32", crc32_str);
-            esp_http_client_set_header(client, "X-Idempotency-Key", idem_key);
-
-            vTaskDelay(pdMS_TO_TICKS(backoff_jitter_ms(retries, 500)));
-            err = esp_http_client_perform(client);
-            retries++;
+        if (!retryable || attempt == max_attempts) {
+            break;
         }
 
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Final upload failure after retries, aborting collection");
-            is_collecting = false;
-        } else {
-            ESP_LOGI(TAG, "Upload retry succeeded for sub-batch %d", params->sub_batch_idx + 1);
-            esp_http_client_cleanup(client);
-            client = NULL;
-        }
+        vTaskDelay(pdMS_TO_TICKS(backoff_jitter_ms(attempt - 1, 500)));
+    }
+
+    if (!upload_success) {
+        ESP_LOGE(TAG,
+                 "Final upload failure for sub-batch %d after retries (err=%s status=%d); aborting collection",
+                 params->sub_batch_idx + 1,
+                 esp_err_to_name(last_err),
+                 last_http_status);
+        is_collecting = false;
     }
 
     // Firmware fallback completion event after final sub-batch upload
-    if (params->sub_batch_idx == params->total_sub_batches - 1) {
-        esp_http_client_cleanup(client);
-        client = NULL;
-
+    if (upload_success && params->sub_batch_idx == params->total_sub_batches - 1) {
         cJSON *msg_obj = cJSON_CreateObject();
         if (msg_obj) {
             cJSON_AddStringToObject(msg_obj, "event", "collection_complete");
             cJSON_AddStringToObject(msg_obj, "label", params->label);
-            if (current_session_id[0] != '\0') {
-                cJSON_AddStringToObject(msg_obj, "session", current_session_id);
+            if (params->session_id[0] != '\0') {
+                cJSON_AddStringToObject(msg_obj, "session", params->session_id);
             }
             cJSON_AddStringToObject(msg_obj, "source", "firmware");
             char *json_str = cJSON_PrintUnformatted(msg_obj);
@@ -859,8 +1892,7 @@ static void send_batch_http_task(void *pvParameters)
         ESP_LOGI(TAG, "Free Heap: %" PRIu32 " bytes", esp_get_free_heap_size());
     }
 
-    free(params->label);
-    free(params);
+    free_http_task_params(params);
 
     vTaskDelete(NULL);
 }
@@ -943,15 +1975,28 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         last_csi_max = (float)max_norm;
     }
 
-    // Print current CSI vector continuously for monitor visibility.
-    log_current_csi_row(normalized_row, valid_sc_count, info->rx_ctrl.rssi);
+    // Avoid high-rate serial logs while idle; keep verbose CSI logs only when
+    // actively collecting or inferring.
+    if (is_collecting || model_ready) {
+        log_current_csi_row(normalized_row, valid_sc_count, info->rx_ctrl.rssi);
+    }
 
     // --- PATH A: INFERENCE (offloaded to a separate task to avoid blocking the Wi‑Fi callback) ---
     if (model_ready && inference_queue) {
         inference_sample_t sample;
         memcpy(sample.normalized, normalized_row, ACTIVE_SUBCARRIERS);
-        // Non-blocking: drop if queue is full.
-        xQueueSendToBack(inference_queue, &sample, 0);
+        // Non-blocking enqueue: if queue is full, drop and track the rate.
+        BaseType_t queued = xQueueSendToBack(inference_queue, &sample, 0);
+        if (queued != pdPASS) {
+            inference_drop_count++;
+            if ((inference_drop_count % INFERENCE_DROP_LOG_INTERVAL) == 0) {
+                ESP_LOGW(TAG,
+                         "Inference queue full: dropped=%" PRIu32 " (queue_depth=%d waiting=%u)",
+                         inference_drop_count,
+                         INFERENCE_QUEUE_DEPTH,
+                         (unsigned)uxQueueMessagesWaiting(inference_queue));
+            }
+        }
     }
 
     // --- PATH B: DATA COLLECTION (gated by MQTT command) ---
@@ -969,19 +2014,40 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
 
             http_task_params_t *params = (http_task_params_t *)malloc(sizeof(http_task_params_t));
             if (params != NULL) {
+                memset(params, 0, sizeof(*params));
                 params->label = strdup(collection_label);
                 params->sub_batch_idx = sub_batch_idx;
                 params->total_sub_batches = (SAMPLE_SIZE / SUB_BATCH_SIZE);
+                snprintf(params->session_id, sizeof(params->session_id), "%s", current_session_id);
 
-                if (xTaskCreate(send_batch_http_task,
-                                "http_batch_upload",
-                                8192,
-                                params,
-                                5,
-                                NULL) != pdPASS) {
-                    ESP_LOGE(TAG, "Failed to create HTTP upload task");
-                    free(params->label);
-                    free(params);
+                params->payload_len = sizeof(csi_buffer);
+                params->payload = (uint8_t *)malloc(params->payload_len);
+
+                if (params->label == NULL || params->payload == NULL) {
+                    ESP_LOGE(TAG,
+                             "Failed to allocate HTTP payload snapshot (label=%p payload=%p len=%u)",
+                             (void *)params->label,
+                             (void *)params->payload,
+                             (unsigned)params->payload_len);
+                    free_http_task_params(params);
+                    params = NULL;
+                }
+
+                if (params != NULL) {
+                    memcpy(params->payload, csi_buffer, params->payload_len);
+                    params->payload_crc32 = esp_crc32_le(0, params->payload, params->payload_len);
+                }
+
+                if (params != NULL) {
+                    if (xTaskCreate(send_batch_http_task,
+                                    "http_batch_upload",
+                                    8192,
+                                    params,
+                                    5,
+                                    NULL) != pdPASS) {
+                        ESP_LOGE(TAG, "Failed to create HTTP upload task");
+                        free_http_task_params(params);
+                    }
                 }
             } else {
                 ESP_LOGE(TAG, "Failed to allocate memory for HTTP task parameters");
@@ -1011,17 +2077,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_TRAINING_COMPLETE_TOPIC, 1);
+        esp_mqtt_client_subscribe(event->client, ESP32_LOAD_MODEL_TOPIC, 1);
         mqtt_client = event->client;
         mqtt_connected = true;
         // Notify the dashboard that we are online and include model status.
         publish_status("node_online", true, true);
         notify_status_task();
+
+        // Auto-reload model on reconnect (since RAM is cleared on reset)
+        if (auto_load_model_on_reconnect && !model_ready && !model_download_in_progress) {
+            ESP_LOGI(TAG, "Auto-loading model on MQTT reconnect");
+            model_download_in_progress = true;
+            if (xTaskCreate(download_model_and_params_task,
+                            "model_dl_auto",
+                            8192,
+                            NULL,
+                            5,
+                            NULL) != pdPASS) {
+                model_download_in_progress = false;
+                ESP_LOGE(TAG, "Failed to create auto model download task");
+            }
+        }
         break;
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT Disconnected");
         mqtt_connected = false;
-        publish_status("node_offline", false, true);
+        // Avoid publish attempts while disconnected; broker LWT advertises offline.
         mqtt_client = NULL;
         notify_status_task();
         break;
@@ -1069,7 +2151,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             packet_idx = 0;
             sub_batch_idx = 0;
             is_collecting = true;
-            reset_prediction_history();
+            reset_state_machine();
 
             ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)",
                      collection_label,
@@ -1114,6 +2196,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         model_download_in_progress = false;
                         ESP_LOGE(TAG, "Failed to create model download task");
                     }
+                }
+            }
+        } else if (mqtt_topic_equals(event, ESP32_LOAD_MODEL_TOPIC)) {
+            // Manual model load for debugging: bypass training_complete requirement
+            publish_ack("load_model");
+            if (model_download_in_progress) {
+                ESP_LOGW(TAG, "Ignoring load_model: model download already in progress");
+            } else {
+                ESP_LOGI(TAG, "Manual model load requested (load_model)");
+                model_download_in_progress = true;
+                if (xTaskCreate(download_model_and_params_task,
+                                "model_dl",
+                                8192,
+                                NULL,
+                                5,
+                                NULL) != pdPASS) {
+                    model_download_in_progress = false;
+                    ESP_LOGE(TAG, "Failed to create model download task");
                 }
             }
         }
@@ -1213,8 +2313,12 @@ static void vLogFreeHeap(void *pvParameters)
                            model_ready ? "true" : "false",
                            model_download_armed ? "true" : "false");
         if (len > 0 && len < (int)sizeof(hb_buf)) {
-            if (!publish_with_retry(ESP32_STATUS_TOPIC, hb_buf, 1)) {
-                ESP_LOGW(TAG, "Heartbeat publish failed");
+            if (mqtt_connected) {
+                if (!publish_with_retry(ESP32_STATUS_TOPIC, hb_buf, 1)) {
+                    ESP_LOGW(TAG, "Heartbeat publish failed");
+                }
+            } else {
+                ESP_LOGI(TAG, "Skipping heartbeat publish: MQTT disconnected");
             }
         } else {
             ESP_LOGW(TAG, "Heartbeat message truncated");
@@ -1300,7 +2404,7 @@ static void wifi_init_sta(void)
 
     // Inference offload: do TFLM inference outside of the Wi‑Fi CSI callback
     // so the Wi‑Fi stack and MQTT keep-alive remain responsive.
-    inference_queue = xQueueCreate(16, sizeof(inference_sample_t));
+    inference_queue = xQueueCreate(INFERENCE_QUEUE_DEPTH, sizeof(inference_sample_t));
     if (inference_queue) {
         // Run inference at a lower priority than the Wi-Fi/MQTT stack so
         // they remain responsive even when inference computation is heavy.
@@ -1319,10 +2423,13 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    for (int i = 0; i < ACTIVE_SUBCARRIERS; i++) {
+    for (int i = 0; i < MAX_MODEL_FEATURES_PER_FRAME; i++) {
         std_vals[i] = 1.0f;
     }
+    model_features_per_frame = ACTIVE_SUBCARRIERS;
+    model_input_elements = model_features_per_frame;
     tflm_reset();
+    reset_state_machine();
 
     wifi_init_sta();
 

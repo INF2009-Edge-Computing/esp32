@@ -50,6 +50,8 @@ This workspace consists of two cooperating components:
 -- **Extending firmware**: edit `receiver.c` above the Wi‑Fi initialization, use
   `publish_with_retry` for MQTT, `esp_http_client` for upload; follow patterns
   already in place for sessions.
+-- **Manual model management (debugging)**: use `push_model.py` to upload `.tflite`
+  models and trigger immediate loading without the full training loop. See section below.
 -- **Tests & debugging**: rely on `SETUP_TEST.md` for manual end‑to-end steps.
 -- **Cross‑component changes**: always update MQTT topic constants in all
   relevant files (`receiver.c`, `dashboard.py`, `trigger_collect.py`).
@@ -62,11 +64,61 @@ This workspace consists of two cooperating components:
 edge-esp32/
   main/receiver.c           # firmware
   CMakeLists.txt
-  server.py                 # Python ingest
+  push_model.py             # Manual model upload utility
+  trigger_collect.py        # MQTT trigger for data collection
+  broadcast_generator.py    # Broadcast traffic generator
+  server.py                 # Python ingest (in older structure)
 inf2009_proj/
   dashboard.py             # GUI + MQTT client
+  push_model.py            # Manual model upload utility (copy)
+  server.py                # Flask ingest
   testlog.py               # MQTT traffic generator
 ```
+
+## Manual Model Management for Debugging
+
+The new `push_model.py` script allows you to upload `.tflite` models directly
+without running the full training pipeline. This is useful for testing and debugging.
+
+**Features:**
+- Upload a `.tflite` model file to the server's model store
+- Optionally upload custom `scaler_params.json`
+- Auto-reload on ESP32 reconnect (power cycle or Wi-Fi drop)
+- Manual trigger via new MQTT topic: `/commands/<NODE>/load_model`
+
+**Firmware changes (receiver.cpp):**
+- New MQTT topic: `/commands/<NODE>/load_model` for manual model loading
+- Auto-reload flag: models are automatically downloaded when ESP32 reconnects to MQTT
+- No longer requires `training_complete` before loading a model
+
+**Usage:**
+```bash
+# Push a model to server for RACK_3
+python push_model.py model.tflite --node RACK_3
+
+# Push model with custom scaler params and trigger load immediately
+python push_model.py model.tflite --params params.json --node RACK_3 --load
+
+# Just trigger load of existing model on server (useful after manual model_store edits)
+python push_model.py --node RACK_3 --load
+
+# For edge-esp32 directory:
+cd edge-esp32
+python push_model.py ../inf2009_proj/my_model.tflite --node RACK_3 --load
+```
+
+**How it works:**
+1. Model files are stored in `inf2009_proj/model_store/<NODE>/model.tflite`
+2. Scaler params are stored in `inf2009_proj/model_store/<NODE>/scaler_params.json`
+3. ESP32 firmware fetches via HTTP endpoints: `/model/<NODE>` and `/params/<NODE>`
+4. When you use `--load`, it sends MQTT to `/commands/<NODE>/load_model`
+5. ESP32 downloads and loads immediately (bypass the training_complete gating)
+
+**Auto-reload behavior:**
+- When ESP32 connects to MQTT (after boot or reconnection), it automatically
+  triggers model download if model is not already ready
+- This means the model survives the next power cycle without manual intervention
+- Disable with `auto_load_model_on_reconnect = false` in firmware if needed
 
 -The rest of the repo contains build outputs, Python virtualenvs, etc.
 
