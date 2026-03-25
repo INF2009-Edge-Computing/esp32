@@ -3,6 +3,11 @@
 #include <string.h>
 #include <new>
 #include <math.h>
+#include <limits.h>
+
+extern "C" {
+#include "esp_timer.h"
+}
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -24,6 +29,31 @@ static TfLiteTensor *g_output = nullptr;
 static const unsigned char *g_model_data = nullptr;
 static size_t g_model_size = 0;
 static char g_last_error[160] = "not initialized";
+static uint32_t g_last_invoke_us = 0;
+static uint32_t g_min_invoke_us = UINT32_MAX;
+static uint32_t g_max_invoke_us = 0;
+static uint64_t g_total_invoke_us = 0;
+static uint32_t g_invoke_sample_count = 0;
+
+static void update_invoke_profile(uint32_t invoke_us) {
+    g_last_invoke_us = invoke_us;
+    if (invoke_us < g_min_invoke_us) {
+        g_min_invoke_us = invoke_us;
+    }
+    if (invoke_us > g_max_invoke_us) {
+        g_max_invoke_us = invoke_us;
+    }
+    g_total_invoke_us += invoke_us;
+    g_invoke_sample_count++;
+}
+
+static void reset_invoke_profile_internal(void) {
+    g_last_invoke_us = 0;
+    g_min_invoke_us = UINT32_MAX;
+    g_max_invoke_us = 0;
+    g_total_invoke_us = 0;
+    g_invoke_sample_count = 0;
+}
 
 static void set_error(const char *msg) {
     if (!msg) {
@@ -237,6 +267,8 @@ bool tflm_load_model(const unsigned char *model_data, size_t model_size) {
         return false;
     }
 
+    reset_invoke_profile_internal();
+
     set_error("ok");
     return true;
 }
@@ -304,7 +336,19 @@ int tflm_predict_with_probs(const float *input,
         return -1;
     }
 
-    if (g_interpreter->Invoke() != kTfLiteOk) {
+    int64_t invoke_start_us = esp_timer_get_time();
+    TfLiteStatus invoke_status = g_interpreter->Invoke();
+    int64_t invoke_end_us = esp_timer_get_time();
+    uint32_t invoke_us = 0;
+    if (invoke_end_us > invoke_start_us) {
+        int64_t delta = invoke_end_us - invoke_start_us;
+        invoke_us = static_cast<uint32_t>(delta > static_cast<int64_t>(UINT32_MAX)
+                                              ? UINT32_MAX
+                                              : delta);
+    }
+    update_invoke_profile(invoke_us);
+
+    if (invoke_status != kTfLiteOk) {
         set_error("Invoke failed");
         return -1;
     }
@@ -380,6 +424,31 @@ size_t tflm_input_element_count(void) {
     return 0;
 }
 
+bool tflm_get_inference_profile(tflm_inference_profile_t *out_profile) {
+    if (!out_profile) {
+        return false;
+    }
+
+    out_profile->last_us = g_last_invoke_us;
+    out_profile->sample_count = g_invoke_sample_count;
+
+    if (g_invoke_sample_count == 0) {
+        out_profile->min_us = 0;
+        out_profile->max_us = 0;
+        out_profile->avg_us = 0;
+        return false;
+    }
+
+    out_profile->min_us = (g_min_invoke_us == UINT32_MAX) ? 0 : g_min_invoke_us;
+    out_profile->max_us = g_max_invoke_us;
+    out_profile->avg_us = static_cast<uint32_t>(g_total_invoke_us / g_invoke_sample_count);
+    return true;
+}
+
+void tflm_reset_inference_profile(void) {
+    reset_invoke_profile_internal();
+}
+
 void tflm_reset(void) {
     if (g_interpreter) {
         delete g_interpreter;
@@ -390,6 +459,7 @@ void tflm_reset(void) {
     g_output = nullptr;
     g_model_data = nullptr;
     g_model_size = 0;
+    reset_invoke_profile_internal();
     set_error("reset");
 }
 
