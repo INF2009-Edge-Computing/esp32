@@ -4,6 +4,7 @@
 #include <new>
 #include <math.h>
 
+#include "esp_timer.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -24,6 +25,12 @@ static TfLiteTensor *g_output = nullptr;
 static const unsigned char *g_model_data = nullptr;
 static size_t g_model_size = 0;
 static char g_last_error[160] = "not initialized";
+
+static uint32_t g_tflm_last_us = 0;
+static uint64_t g_tflm_total_us = 0;
+static uint32_t g_tflm_min_us = UINT32_MAX;
+static uint32_t g_tflm_max_us = 0;
+static uint32_t g_tflm_sample_count = 0;
 
 static void set_error(const char *msg) {
     if (!msg) {
@@ -304,9 +311,22 @@ int tflm_predict_with_probs(const float *input,
         return -1;
     }
 
+    int64_t start_us = esp_timer_get_time();
     if (g_interpreter->Invoke() != kTfLiteOk) {
         set_error("Invoke failed");
         return -1;
+    }
+    int64_t end_us = esp_timer_get_time();
+    uint32_t duration_us = static_cast<uint32_t>(end_us - start_us);
+
+    g_tflm_last_us = duration_us;
+    g_tflm_total_us += duration_us;
+    g_tflm_sample_count++;
+    if (duration_us < g_tflm_min_us) {
+        g_tflm_min_us = duration_us;
+    }
+    if (duration_us > g_tflm_max_us) {
+        g_tflm_max_us = duration_us;
     }
 
     float logits_or_probs[32] = {0.0f};
@@ -378,6 +398,19 @@ size_t tflm_input_element_count(void) {
     }
 
     return 0;
+}
+
+bool tflm_get_inference_profile(tflm_inference_profile_t *profile) {
+    if (!profile || g_tflm_sample_count == 0) {
+        return false;
+    }
+
+    profile->last_us = g_tflm_last_us;
+    profile->avg_us = static_cast<uint32_t>(g_tflm_total_us / g_tflm_sample_count);
+    profile->min_us = g_tflm_min_us;
+    profile->max_us = g_tflm_max_us;
+    profile->sample_count = g_tflm_sample_count;
+    return true;
 }
 
 void tflm_reset(void) {

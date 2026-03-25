@@ -3,6 +3,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <assert.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -46,6 +47,8 @@ extern "C" {
 #define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" CONFIG_CSI_NODE_ID "/training_complete"
 #define ESP32_LOAD_MODEL_TOPIC        "/commands/" CONFIG_CSI_NODE_ID "/load_model"
 #define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
+#define ESP32_PERF_BIN_TOPIC          "/sensors/"  CONFIG_CSI_NODE_ID "/perf_bin"
+#define ESP32_DEVICE_STATUS_TOPIC     "device/" CONFIG_CSI_NODE_ID "/status"
 #define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
@@ -95,6 +98,8 @@ static size_t model_window_size = 1;
 static size_t model_window_fill = 0;
 static size_t model_window_head = 0;
 static bool notebook_mode_enabled = false;
+static bool grouped_mode_enabled = false;
+static size_t grouped_feature_count = 0;
 static int selected_subcarriers[MAX_MODEL_FEATURES_PER_FRAME] = {0};
 static int selected_raw_indices[MAX_MODEL_FEATURES_PER_FRAME] = {0};
 static size_t selected_subcarrier_count = 0;
@@ -147,6 +152,9 @@ static bool model_download_in_progress = false;
 #define DRIFT_ENTROPY_THRESHOLD 0.72f
 #define DRIFT_CONFIDENCE_THRESHOLD 0.42f
 #define DRIFT_FEATURE_ABS_THRESHOLD 2.2f
+#define PASO_INFERENCE_BUDGET_US 50000
+#define PASO_PIPELINE_BUDGET_US 500000
+#define PASO_PERF_PUBLISH_INTERVAL_SAMPLES 50
 
 static TaskHandle_t status_task_handle = NULL;
 static bool last_published_mqtt_connected = false;
@@ -178,9 +186,24 @@ typedef struct {
     uint32_t payload_crc32;
 } http_task_params_t;
 
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t reserved;
+    uint16_t payload_size;
+    uint32_t invoke_last_us;
+    uint32_t invoke_avg_us;
+    uint32_t invoke_min_us;
+    uint32_t invoke_max_us;
+    uint32_t sample_count;
+    int32_t queue_wait_us;
+    int32_t feature_us;
+    int32_t invoke_stage_us;
+    int32_t pipeline_total_us;
+    uint32_t free_heap;
+} paso_perf_payload_t;
+
 static esp_http_client_handle_t client = NULL;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
-static const char MQTT_OFFLINE_WILL_PAYLOAD[] = "{\"event\":\"node_offline\"}";
 
 // Cap the exponent to prevent excessive delays (base_ms * 2^exponent).
 // With base_ms=500 and max_exponent=6, the maximum base delay is 32s.
@@ -260,6 +283,57 @@ static void publish_ack(const char *cmd)
         free(json_str);
     }
     cJSON_Delete(obj);
+}
+
+static int32_t clamp_i64_to_i32(int64_t value)
+{
+    if (value > 2147483647LL) {
+        return 2147483647;
+    }
+    if (value < -2147483648LL) {
+        return -2147483648;
+    }
+    return (int32_t)value;
+}
+
+static void publish_perf_binary_metrics(int64_t queue_wait_us,
+                                        int64_t feature_us,
+                                        int64_t invoke_stage_us,
+                                        int64_t pipeline_total_us)
+{
+    if (!mqtt_connected || mqtt_client == NULL) {
+        return;
+    }
+
+    tflm_inference_profile_t prof = {};
+    if (!tflm_get_inference_profile(&prof)) {
+        return;
+    }
+
+    paso_perf_payload_t payload = {};
+    payload.version = 1;
+    payload.reserved = 0;
+    payload.payload_size = (uint16_t)sizeof(payload);
+    payload.invoke_last_us = prof.last_us;
+    payload.invoke_avg_us = prof.avg_us;
+    payload.invoke_min_us = prof.min_us;
+    payload.invoke_max_us = prof.max_us;
+    payload.sample_count = prof.sample_count;
+    payload.queue_wait_us = clamp_i64_to_i32(queue_wait_us);
+    payload.feature_us = clamp_i64_to_i32(feature_us);
+    payload.invoke_stage_us = clamp_i64_to_i32(invoke_stage_us);
+    payload.pipeline_total_us = clamp_i64_to_i32(pipeline_total_us);
+    payload.free_heap = esp_get_free_heap_size();
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client,
+                                         ESP32_PERF_BIN_TOPIC,
+                                         (const char *)&payload,
+                                         (int)sizeof(payload),
+                                         0,
+                                         0);
+    if (msg_id < 0) {
+        ESP_LOGW(TAG, "Failed to publish perf binary payload topic=%s", ESP32_PERF_BIN_TOPIC);
+    }
 }
 
 static void publish_model_download_memory_error(const char *asset,
@@ -369,8 +443,111 @@ static int raw_index_for_subcarrier(int sc)
     return sc - MAX_LOWER - 1;
 }
 
+static bool parse_feature_column_subcarrier(const char *name, int *out_sc)
+{
+    if (!name || !out_sc || strncmp(name, "SC_", 3) != 0) {
+        return false;
+    }
+
+    char *endptr = NULL;
+    long parsed = strtol(name + 3, &endptr, 10);
+    if (endptr == name + 3 || *endptr != '\0') {
+        return false;
+    }
+    int sc = (int)parsed;
+    int raw_idx = raw_index_for_subcarrier(sc);
+    if (raw_idx < 0 || raw_idx >= ACTIVE_SUBCARRIERS) {
+        return false;
+    }
+
+    *out_sc = sc;
+    return true;
+}
+
+static bool infer_feature_layout_from_feature_columns(cJSON *feature_columns_arr, int feature_count)
+{
+    if (!cJSON_IsArray(feature_columns_arr) || feature_count <= 1) {
+        return false;
+    }
+
+    if (cJSON_GetArraySize(feature_columns_arr) != feature_count) {
+        return false;
+    }
+
+    bool looks_grouped = true;
+    bool looks_notebook = true;
+    int parsed_subcarriers[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+    int parsed_raw_indices[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+
+    for (int i = 0; i < feature_count; i++) {
+        cJSON *item = cJSON_GetArrayItem(feature_columns_arr, i);
+        if (!cJSON_IsString(item) || !item->valuestring) {
+            return false;
+        }
+
+        const char *col = item->valuestring;
+        if (i < feature_count - 1) {
+            if (strncmp(col, "GROUP_", 6) != 0) {
+                looks_grouped = false;
+            }
+            if (strncmp(col, "SC_", 3) != 0) {
+                looks_notebook = false;
+            }
+        } else {
+            if (strcmp(col, "AVG_VARIATION") != 0) {
+                looks_grouped = false;
+                looks_notebook = false;
+            }
+        }
+    }
+
+    if (looks_grouped) {
+        grouped_mode_enabled = true;
+        grouped_feature_count = (size_t)(feature_count - 1);
+        notebook_mode_enabled = false;
+        selected_subcarrier_count = 0;
+        return true;
+    }
+
+    if (looks_notebook) {
+        for (int i = 0; i < feature_count - 1; i++) {
+            cJSON *item = cJSON_GetArrayItem(feature_columns_arr, i);
+            if (!cJSON_IsString(item) || !item->valuestring) {
+                return false;
+            }
+
+            int sc = 0;
+            if (!parse_feature_column_subcarrier(item->valuestring, &sc)) {
+                return false;
+            }
+
+            parsed_subcarriers[i] = sc;
+            parsed_raw_indices[i] = raw_index_for_subcarrier(sc);
+            if (parsed_raw_indices[i] < 0) {
+                return false;
+            }
+        }
+
+        for (int i = 0; i < feature_count - 1; i++) {
+            selected_subcarriers[i] = parsed_subcarriers[i];
+            selected_raw_indices[i] = parsed_raw_indices[i];
+        }
+        selected_subcarrier_count = (size_t)(feature_count - 1);
+        notebook_mode_enabled = true;
+        grouped_mode_enabled = false;
+        grouped_feature_count = 0;
+        return true;
+    }
+
+    return false;
+}
+
 static bool is_supported_feature_layout(size_t feature_count)
 {
+    if (grouped_mode_enabled) {
+        return grouped_feature_count > 0 && feature_count == (grouped_feature_count + 1);
+    }
+
     if (notebook_mode_enabled) {
         return selected_subcarrier_count > 0 && feature_count == (selected_subcarrier_count + 1);
     }
@@ -481,6 +658,52 @@ static bool build_notebook_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIE
     }
 
     out_features[selected_subcarrier_count] = avg_variation / (session_baseline + FEATURE_EPSILON);
+    return true;
+}
+
+static bool build_grouped_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
+                                         float *out_features,
+                                         size_t out_count)
+{
+    if (!grouped_mode_enabled ||
+        grouped_feature_count == 0 ||
+        out_features == NULL ||
+        raw_row == NULL ||
+        out_count != (grouped_feature_count + 1)) {
+        return false;
+    }
+
+    size_t base_group_len = ACTIVE_SUBCARRIERS / grouped_feature_count;
+    size_t remainder = ACTIVE_SUBCARRIERS % grouped_feature_count;
+    size_t cursor = 0;
+
+    for (size_t g = 0; g < grouped_feature_count; g++) {
+        size_t this_group_len = base_group_len + ((g < remainder) ? 1 : 0);
+        if (this_group_len == 0 || (cursor + this_group_len) > ACTIVE_SUBCARRIERS) {
+            return false;
+        }
+
+        float sum = 0.0f;
+        for (size_t k = 0; k < this_group_len; k++) {
+            sum += (float)raw_row[cursor + k];
+        }
+        out_features[g] = sum / (float)this_group_len;
+        cursor += this_group_len;
+    }
+
+    float mean = 0.0f;
+    for (size_t g = 0; g < grouped_feature_count; g++) {
+        mean += out_features[g];
+    }
+    mean /= (float)grouped_feature_count;
+
+    float var = 0.0f;
+    for (size_t g = 0; g < grouped_feature_count; g++) {
+        float d = out_features[g] - mean;
+        var += d * d;
+    }
+    var /= (float)grouped_feature_count;
+    out_features[grouped_feature_count] = sqrtf(var);
     return true;
 }
 
@@ -621,6 +844,9 @@ static bool build_frame_features(const uint8_t raw_row[ACTIVE_SUBCARRIERS],
                                  float *out_features,
                                  size_t out_count)
 {
+    if (grouped_mode_enabled) {
+        return build_grouped_frame_features(raw_row, out_features, out_count);
+    }
     if (notebook_mode_enabled) {
         return build_notebook_frame_features(raw_row, out_features, out_count);
     }
@@ -1103,6 +1329,7 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
 
     cJSON *mean_arr = cJSON_GetObjectItem(root, "mean");
     cJSON *std_arr = cJSON_GetObjectItem(root, "std");
+    cJSON *feature_columns_arr = cJSON_GetObjectItem(root, "feature_columns");
     if (!cJSON_IsArray(mean_arr) || !cJSON_IsArray(std_arr)) {
         cJSON_Delete(root);
         ESP_LOGE(TAG, "scaler params missing mean/std arrays");
@@ -1141,6 +1368,8 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
     }
 
     notebook_mode_enabled = false;
+    grouped_mode_enabled = false;
+    grouped_feature_count = 0;
     selected_subcarrier_count = 0;
     notebook_extract_window_size = 5;
     notebook_calibration_frames = 20;
@@ -1151,7 +1380,7 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
     cJSON *selected_sc = cJSON_GetObjectItem(root, "selected_subcarriers");
     if (cJSON_IsArray(selected_sc)) {
         int sc_count = cJSON_GetArraySize(selected_sc);
-        if (sc_count > 0 && sc_count < MAX_MODEL_FEATURES_PER_FRAME && (sc_count + 1) == lim) {
+        if (sc_count > 0 && sc_count < MAX_MODEL_FEATURES_PER_FRAME) {
             bool valid = true;
             for (int i = 0; i < sc_count; i++) {
                 cJSON *jsc = cJSON_GetArrayItem(selected_sc, i);
@@ -1173,54 +1402,75 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
 
             if (valid) {
                 selected_subcarrier_count = (size_t)sc_count;
-                notebook_mode_enabled = true;
-
-                cJSON *notebook_cfg = cJSON_GetObjectItem(root, "notebook_alignment");
-                if (cJSON_IsObject(notebook_cfg)) {
-                    cJSON *j_window = cJSON_GetObjectItem(notebook_cfg, "extract_window_size");
-                    if (cJSON_IsNumber(j_window)) {
-                        int w = (int)j_window->valuedouble;
-                        if (w < 1) {
-                            w = 1;
-                        }
-                        if (w > NOTEBOOK_MAX_EXTRACT_WINDOW) {
-                            w = NOTEBOOK_MAX_EXTRACT_WINDOW;
-                        }
-                        notebook_extract_window_size = w;
-                    }
-
-                    cJSON *j_cal_frames = cJSON_GetObjectItem(notebook_cfg, "calibration_frames");
-                    if (cJSON_IsNumber(j_cal_frames)) {
-                        int cf = (int)j_cal_frames->valuedouble;
-                        if (cf < 1) {
-                            cf = 1;
-                        }
-                        notebook_calibration_frames = cf;
-                    }
-
-                    cJSON *j_baseline = cJSON_GetObjectItem(notebook_cfg, "train_baseline");
-                    if (cJSON_IsNumber(j_baseline)) {
-                        notebook_train_baseline = (float)j_baseline->valuedouble;
-                    }
-                    if (notebook_train_baseline <= FEATURE_EPSILON) {
-                        notebook_train_baseline = 1.0f;
-                    }
-
-                    cJSON *j_train_mean = cJSON_GetObjectItem(notebook_cfg, "train_mean");
-                    if (cJSON_IsNumber(j_train_mean)) {
-                        notebook_train_mean = (float)j_train_mean->valuedouble;
-                    }
-
-                    cJSON *j_use_offset = cJSON_GetObjectItem(notebook_cfg, "use_session_offset");
-                    if (cJSON_IsBool(j_use_offset)) {
-                        notebook_use_session_offset = cJSON_IsTrue(j_use_offset);
-                    }
-                }
+                notebook_mode_enabled = ((sc_count + 1) == lim);
             }
         }
     }
 
+    cJSON *notebook_cfg = cJSON_GetObjectItem(root, "notebook_alignment");
+    if (cJSON_IsObject(notebook_cfg)) {
+        cJSON *j_window = cJSON_GetObjectItem(notebook_cfg, "extract_window_size");
+        if (cJSON_IsNumber(j_window)) {
+            int w = (int)j_window->valuedouble;
+            if (w < 1) {
+                w = 1;
+            }
+            if (w > NOTEBOOK_MAX_EXTRACT_WINDOW) {
+                w = NOTEBOOK_MAX_EXTRACT_WINDOW;
+            }
+            notebook_extract_window_size = w;
+        }
+
+        cJSON *j_cal_frames = cJSON_GetObjectItem(notebook_cfg, "calibration_frames");
+        if (cJSON_IsNumber(j_cal_frames)) {
+            int cf = (int)j_cal_frames->valuedouble;
+            if (cf < 1) {
+                cf = 1;
+            }
+            notebook_calibration_frames = cf;
+        }
+
+        cJSON *j_baseline = cJSON_GetObjectItem(notebook_cfg, "train_baseline");
+        if (cJSON_IsNumber(j_baseline)) {
+            notebook_train_baseline = (float)j_baseline->valuedouble;
+        }
+        if (notebook_train_baseline <= FEATURE_EPSILON) {
+            notebook_train_baseline = 1.0f;
+        }
+
+        cJSON *j_train_mean = cJSON_GetObjectItem(notebook_cfg, "train_mean");
+        if (cJSON_IsNumber(j_train_mean)) {
+            notebook_train_mean = (float)j_train_mean->valuedouble;
+        }
+
+        cJSON *j_use_offset = cJSON_GetObjectItem(notebook_cfg, "use_session_offset");
+        if (cJSON_IsBool(j_use_offset)) {
+            notebook_use_session_offset = cJSON_IsTrue(j_use_offset);
+        }
+
+        cJSON *j_feature_mode = cJSON_GetObjectItem(notebook_cfg, "feature_mode");
+        if (cJSON_IsString(j_feature_mode) && j_feature_mode->valuestring &&
+            strcmp(j_feature_mode->valuestring, "grouped") == 0) {
+            int parsed_group_count = lim - 1;
+            cJSON *j_group_count = cJSON_GetObjectItem(notebook_cfg, "group_count");
+            if (cJSON_IsNumber(j_group_count)) {
+                parsed_group_count = (int)j_group_count->valuedouble;
+            }
+
+            if (parsed_group_count > 0 && (parsed_group_count + 1) == lim) {
+                grouped_mode_enabled = true;
+                grouped_feature_count = (size_t)parsed_group_count;
+                notebook_mode_enabled = false;
+            }
+        }
+    }
+
+    if (!notebook_mode_enabled && !grouped_mode_enabled) {
+        (void)infer_feature_layout_from_feature_columns(feature_columns_arr, lim);
+    }
+
     if (!notebook_mode_enabled &&
+        !grouped_mode_enabled &&
         lim != COMPACT_FEATURE_COUNT &&
         lim != LEGACY_RAW55_FEATURE_COUNT &&
         lim != LEGACY_RAW56_FEATURE_COUNT) {
@@ -1239,10 +1489,11 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
     notebook_variation_baseline_count = 0;
 
     ESP_LOGI(TAG,
-             "Loaded scaler: feature_count=%d mode=%s selected_subcarriers=%u extract_window=%d calib_frames=%d",
+             "Loaded scaler: feature_count=%d mode=%s selected_subcarriers=%u grouped_features=%u extract_window=%d calib_frames=%d",
              lim,
-             notebook_mode_enabled ? "notebook" : "legacy",
+             grouped_mode_enabled ? "grouped" : (notebook_mode_enabled ? "notebook" : "legacy"),
              (unsigned)selected_subcarrier_count,
+             (unsigned)grouped_feature_count,
              notebook_extract_window_size,
              notebook_calibration_frames);
 
@@ -1252,6 +1503,8 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
 
 static int run_model(const float *input, size_t len, float out_probs[3], float *out_confidence)
 {
+    static uint32_t inference_profile_log_counter = 0;
+
     if (!model_ready || !input || len == 0) {
         return -1;
     }
@@ -1275,6 +1528,27 @@ static int run_model(const float *input, size_t len, float out_probs[3], float *
     if (out_confidence != NULL) {
         *out_confidence = confidence;
     }
+
+    inference_profile_log_counter++;
+    if ((inference_profile_log_counter % PASO_PERF_PUBLISH_INTERVAL_SAMPLES) == 0) {
+        tflm_inference_profile_t prof = {};
+        if (tflm_get_inference_profile(&prof)) {
+            ESP_LOGI(TAG,
+                     "TFLM invoke_us last=%" PRIu32 " avg=%" PRIu32 " min=%" PRIu32 " max=%" PRIu32 " n=%" PRIu32,
+                     prof.last_us,
+                     prof.avg_us,
+                     prof.min_us,
+                     prof.max_us,
+                     prof.sample_count);
+            if (prof.avg_us > PASO_INFERENCE_BUDGET_US) {
+                ESP_LOGW(TAG,
+                         "PASO budget exceed: invoke avg=%" PRIu32 "us > %dus",
+                         prof.avg_us,
+                         PASO_INFERENCE_BUDGET_US);
+            }
+        }
+    }
+
     return pred;
 }
 
@@ -1466,12 +1740,19 @@ static void vInferenceTask(void *pvParameters)
     (void)pvParameters;
 
     inference_sample_t sample;
+    uint32_t inference_stage_log_counter = 0;
     for (;;) {
         if (inference_queue == NULL) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        if (xQueueReceive(inference_queue, &sample, pdMS_TO_TICKS(1000)) == pdPASS) {
+        int64_t dequeue_wait_start_us = esp_timer_get_time();
+        BaseType_t recv_status = xQueueReceive(inference_queue, &sample, pdMS_TO_TICKS(1000));
+        int64_t dequeue_wait_us = esp_timer_get_time() - dequeue_wait_start_us;
+
+        if (recv_status == pdPASS) {
+            int64_t pipeline_start_us = esp_timer_get_time();
+
             if (!model_ready) {
                 continue;
             }
@@ -1486,9 +1767,11 @@ static void vInferenceTask(void *pvParameters)
             }
 
             float frame_input[MAX_MODEL_FEATURES_PER_FRAME];
+            int64_t feature_build_start_us = esp_timer_get_time();
             if (!build_frame_features(sample.normalized, frame_input, model_features_per_frame)) {
                 continue;
             }
+            int64_t feature_build_us = esp_timer_get_time() - feature_build_start_us;
 
             float feature_abs_mean = 0.0f;
             for (size_t i = 0; i < model_features_per_frame; i++) {
@@ -1524,8 +1807,31 @@ static void vInferenceTask(void *pvParameters)
 
             float probs[3] = {0.0f, 0.0f, 0.0f};
             float confidence = 0.0f;
+            int64_t invoke_stage_start_us = esp_timer_get_time();
             int pred = run_model(model_input_scratch, model_input_elements, probs, &confidence);
+            int64_t invoke_stage_us = esp_timer_get_time() - invoke_stage_start_us;
             update_state_machine_and_notify(pred, probs, confidence, feature_abs_mean);
+
+            int64_t pipeline_total_us = esp_timer_get_time() - pipeline_start_us;
+            inference_stage_log_counter++;
+            if ((inference_stage_log_counter % PASO_PERF_PUBLISH_INTERVAL_SAMPLES) == 0) {
+                ESP_LOGI(TAG,
+                         "Inference stage_us wait=%" PRIi64 " feature=%" PRIi64 " invoke=%" PRIi64 " total=%" PRIi64,
+                         dequeue_wait_us,
+                         feature_build_us,
+                         invoke_stage_us,
+                         pipeline_total_us);
+                publish_perf_binary_metrics(dequeue_wait_us,
+                                            feature_build_us,
+                                            invoke_stage_us,
+                                            pipeline_total_us);
+                if (pipeline_total_us > PASO_PIPELINE_BUDGET_US) {
+                    ESP_LOGW(TAG,
+                             "PASO budget exceed: pipeline total=%" PRIi64 "us > %dus",
+                             pipeline_total_us,
+                             PASO_PIPELINE_BUDGET_US);
+                }
+            }
 
             // Yield to keep the networking tasks responsive.
             taskYIELD();
@@ -2072,55 +2378,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "MQTT Connected (broker=%s)", MQTT_BROKER_URI);
-
-        // Resolve and log actual broker IP:
-        {
-            const char *uri = MQTT_BROKER_URI;
-            const char *host_start = strstr(uri, "://");
-            if (host_start) {
-                host_start += 3;
-            } else {
-                host_start = uri;
-            }
-
-            char hostport[128] = {0};
-            const char *path = strchr(host_start, '/');
-            size_t hostport_len = path ? (size_t)(path - host_start) : strlen(host_start);
-            if (hostport_len >= sizeof(hostport)) {
-                hostport_len = sizeof(hostport) - 1;
-            }
-            memcpy(hostport, host_start, hostport_len);
-            hostport[hostport_len] = '\0';
-
-            char host[128] = {0};
-            char port[16] = "1883";
-            char *colon = strchr(hostport, ':');
-            if (colon) {
-                *colon = '\0';
-                strlcpy(host, hostport, sizeof(host));
-                strlcpy(port, colon + 1, sizeof(port));
-            } else {
-                strlcpy(host, hostport, sizeof(host));
-            }
-
-            struct addrinfo hints = {};
-            hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
-            struct addrinfo *res = NULL;
-            int err = getaddrinfo(host, port, &hints, &res);
-            if (err == 0 && res) {
-                char ipstr[INET_ADDRSTRLEN];
-                struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
-                inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr));
-                ESP_LOGI(TAG, "MQTT Broker resolved IP: %s (host=%s port=%s)", ipstr, host, port);
-                freeaddrinfo(res);
-            } else {
-                ESP_LOGW(TAG, "Failed to resolve MQTT broker host '%s': err=%d", host, err);
-            }
+        int lwt_online_msg_id = esp_mqtt_client_publish(event->client,
+                                                        ESP32_DEVICE_STATUS_TOPIC,
+                                                        "online",
+                                                        6,
+                                                        1,
+                                                        1);
+        if (lwt_online_msg_id < 0) {
+            ESP_LOGW(TAG, "Failed to publish LWT online message topic=%s", ESP32_DEVICE_STATUS_TOPIC);
         }
-
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_TRAINING_COMPLETE_TOPIC, 1);
@@ -2146,6 +2414,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             }
         }
         break;
+    }
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT Disconnected");
@@ -2264,6 +2533,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
             }
         }
+        break;
+
+    case MQTT_EVENT_ANY:
+    case MQTT_EVENT_ERROR:
+    case MQTT_EVENT_SUBSCRIBED:
+    case MQTT_EVENT_UNSUBSCRIBED:
+    case MQTT_EVENT_PUBLISHED:
+    case MQTT_EVENT_BEFORE_CONNECT:
+    case MQTT_EVENT_DELETED:
+    case MQTT_USER_EVENT:
         break;
 
     default:
@@ -2482,11 +2761,11 @@ extern "C" void app_main(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
-    mqtt_cfg.session.last_will.topic = ESP32_STATUS_TOPIC;
-    mqtt_cfg.session.last_will.msg = MQTT_OFFLINE_WILL_PAYLOAD;
-    mqtt_cfg.session.last_will.msg_len = strlen(MQTT_OFFLINE_WILL_PAYLOAD);
+    mqtt_cfg.session.last_will.topic = ESP32_DEVICE_STATUS_TOPIC;
+    mqtt_cfg.session.last_will.msg = "offline";
+    mqtt_cfg.session.last_will.msg_len = 7;
     mqtt_cfg.session.last_will.qos = 1;
-    mqtt_cfg.session.last_will.retain = true;
+    mqtt_cfg.session.last_will.retain = 1;
 
     esp_mqtt_client_handle_t client_handle = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(client_handle,
