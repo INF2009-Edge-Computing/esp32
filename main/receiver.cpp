@@ -2074,6 +2074,53 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT Connected (broker=%s)", MQTT_BROKER_URI);
+
+        // Resolve and log actual broker IP:
+        {
+            const char *uri = MQTT_BROKER_URI;
+            const char *host_start = strstr(uri, "://");
+            if (host_start) {
+                host_start += 3;
+            } else {
+                host_start = uri;
+            }
+
+            char hostport[128] = {0};
+            const char *path = strchr(host_start, '/');
+            size_t hostport_len = path ? (size_t)(path - host_start) : strlen(host_start);
+            if (hostport_len >= sizeof(hostport)) {
+                hostport_len = sizeof(hostport) - 1;
+            }
+            memcpy(hostport, host_start, hostport_len);
+            hostport[hostport_len] = '\0';
+
+            char host[128] = {0};
+            char port[16] = "1883";
+            char *colon = strchr(hostport, ':');
+            if (colon) {
+                *colon = '\0';
+                strlcpy(host, hostport, sizeof(host));
+                strlcpy(port, colon + 1, sizeof(port));
+            } else {
+                strlcpy(host, hostport, sizeof(host));
+            }
+
+            struct addrinfo hints = {};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            struct addrinfo *res = NULL;
+            int err = getaddrinfo(host, port, &hints, &res);
+            if (err == 0 && res) {
+                char ipstr[INET_ADDRSTRLEN];
+                struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+                inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr));
+                ESP_LOGI(TAG, "MQTT Broker resolved IP: %s (host=%s port=%s)", ipstr, host, port);
+                freeaddrinfo(res);
+            } else {
+                ESP_LOGW(TAG, "Failed to resolve MQTT broker host '%s': err=%d", host, err);
+            }
+        }
+
         esp_mqtt_client_subscribe(event->client, ESP32_COLLECT_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_TRAINING_COMPLETE_TOPIC, 1);
