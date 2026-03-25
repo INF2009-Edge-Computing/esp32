@@ -2273,7 +2273,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_ANY:
+        break;
+    case MQTT_EVENT_BEFORE_CONNECT:
+        break;
+    case MQTT_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "MQTT Connected (broker=%s)", MQTT_BROKER_URI);
         int lwt_online_msg_id = esp_mqtt_client_publish(event->client,
                                                         ESP32_DEVICE_STATUS_TOPIC,
@@ -2308,7 +2312,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGE(TAG, "Failed to create auto model download task");
             }
         }
-        break;
+    } break;
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT Disconnected");
@@ -2316,6 +2320,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Avoid publish attempts while disconnected; broker LWT advertises offline.
         mqtt_client = NULL;
         notify_status_task();
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_SUBSCRIBED event received");
+        break;
+
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_UNSUBSCRIBED event received");
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_PUBLISHED event received");
         break;
 
     case MQTT_EVENT_DATA:
@@ -2427,6 +2443,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
             }
         }
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT_ERROR event received");
+        break;
+
+    case MQTT_EVENT_DELETED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DELETED event received");
+        break;
+
+    case MQTT_USER_EVENT:
+        ESP_LOGI(TAG, "MQTT_USER_EVENT event received");
         break;
 
     default:
