@@ -46,6 +46,7 @@ extern "C" {
 #define ESP32_DOWNLOAD_TOPIC          "/commands/" CONFIG_CSI_NODE_ID "/update_model"
 #define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" CONFIG_CSI_NODE_ID "/training_complete"
 #define ESP32_LOAD_MODEL_TOPIC        "/commands/" CONFIG_CSI_NODE_ID "/load_model"
+#define ESP32_RESET_MODEL_TOPIC       "/commands/" CONFIG_CSI_NODE_ID "/reset_model"
 #define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
 #define ESP32_PERF_BIN_TOPIC          "/sensors/"  CONFIG_CSI_NODE_ID "/perf_bin"
 #define ESP32_DEVICE_STATUS_TOPIC     "device/" CONFIG_CSI_NODE_ID "/status"
@@ -1839,22 +1840,50 @@ static void vInferenceTask(void *pvParameters)
     }
 }
 
+static void clear_loaded_model_runtime(const char *reason, bool publish_event)
+{
+    if (model_buffer) {
+        free(model_buffer);
+        model_buffer = NULL;
+    }
+
+    free_model_input_buffers();
+    model_size = 0;
+    model_ready = false;
+    model_download_armed = false;
+    reset_state_machine();
+    tflm_reset();
+    notify_status_task();
+
+    ESP_LOGI(TAG, "Runtime model cleared (%s)", reason ? reason : "unspecified");
+
+    if (!publish_event) {
+        return;
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return;
+    }
+    cJSON_AddStringToObject(obj, "event", "model_cleared");
+    if (reason && reason[0] != '\0') {
+        cJSON_AddStringToObject(obj, "reason", reason);
+    }
+    char *json_str = cJSON_PrintUnformatted(obj);
+    if (json_str) {
+        publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
+        free(json_str);
+    }
+    cJSON_Delete(obj);
+}
+
 static void download_model_and_params_task(void *pvParameters)
 {
     (void)pvParameters;
 
     // Remove any previously loaded model before downloading a new one. This
     // frees RAM and avoids leaving stale model state in place.
-    if (model_buffer) {
-        free(model_buffer);
-        model_buffer = NULL;
-        free_model_input_buffers();
-        model_size = 0;
-        model_ready = false;
-        tflm_reset();
-        ESP_LOGI(TAG, "Cleared existing model from RAM before downloading a new one");
-        notify_status_task();
-    }
+    clear_loaded_model_runtime("pre_download", false);
 
     for (int attempt = 1; attempt <= 3; attempt++) {
         uint8_t *downloaded_model = NULL;
@@ -2397,6 +2426,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         esp_mqtt_client_subscribe(event->client, ESP32_DOWNLOAD_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_TRAINING_COMPLETE_TOPIC, 1);
         esp_mqtt_client_subscribe(event->client, ESP32_LOAD_MODEL_TOPIC, 1);
+        esp_mqtt_client_subscribe(event->client, ESP32_RESET_MODEL_TOPIC, 1);
         mqtt_client = event->client;
         mqtt_connected = true;
         // Notify the dashboard that we are online and include model status.
@@ -2552,6 +2582,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT_ERROR event received");
+        } else if (mqtt_topic_equals(event, ESP32_RESET_MODEL_TOPIC)) {
+            publish_ack("reset_model");
+            if (model_download_in_progress) {
+                ESP_LOGW(TAG, "Ignoring reset_model: model download already in progress");
+            } else {
+                clear_loaded_model_runtime("remote_reset", true);
+            }
         break;
 
     case MQTT_EVENT_DELETED:
@@ -2778,6 +2815,7 @@ extern "C" void app_main(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
+    mqtt_cfg.session.keepalive = 30;  // reduce timeout for quicker LWT-based detection
     mqtt_cfg.session.last_will.topic = ESP32_DEVICE_STATUS_TOPIC;
     mqtt_cfg.session.last_will.msg = "offline";
     mqtt_cfg.session.last_will.msg_len = 7;

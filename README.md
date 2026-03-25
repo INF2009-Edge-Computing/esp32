@@ -218,6 +218,59 @@ After all parts arrive, it merges and writes final file:
 - Check topic naming mismatch (`RACK_1` vs other ID).
 - Check MQTT broker URI in firmware menuconfig (`CSI Node Configuration`).
 - Confirm broker is running: `sudo systemctl status mosquitto`.
+---
+
+## MQTT Topics and Payloads (firmware ↔ controller)
+
+The project uses topic templates containing the node ID (e.g., `RACK_1`):
+
+- `/commands/<node>/collect`
+  - Firmware subscribes.
+  - Dashboard and `trigger_collect.py` publish.
+  - Payload: plain label (`"door_closed"`) or JSON `{ "label": "...", "session": "...", "campaign_id": "...", "run_id": "...", "split_group": "train|dev|test" }`.
+
+- `/commands/<node>/training_complete`
+  - Dashboard publishes after model training is complete.
+  - Firmware subscribes and arms model download.
+  - Payload: JSON with `session` (e.g., `{ "session": "202405071234" }`).
+
+- `/commands/<node>/update_model`
+  - Legacy firmware command for model download request.
+  - Ignored by firmware until at least one `training_complete` arrives.
+
+- `/commands/<node>/load_model`
+  - Manual debug command from `push_model.py` to force immediate model download.
+
+- `/sensors/<node>/status`
+  - Firmware publishes status/ack/info.
+  - Values are JSON (`model_ready`, `model_download_armed`, `event`: "ack" | "node_online" ...).
+  - Server/dashboard subscribe for UI updates.
+
+- `/sensors/<node>/perf_bin`
+  - Firmware publishes binary performance telemetry (`PASO` profiling):
+    - struct `<BBHIIIIIiiiiI>`
+    - fields: version, reserved, payload_size, invoke_last_us, invoke_avg_us, invoke_min_us, invoke_max_us, sample_count, queue_wait_us, feature_us, invoke_stage_us, pipeline_total_us, free_heap.
+
+- `device/<node>/status`
+  - Firmware publishes last-will-like status: `"online"` / `"offline"`.
+
+### Feature mapping
+
+- Collection flow (CSI capture + upload): `/commands/<node>/collect` → FIRWARE CSI data batching → HTTP `/upload_data`.
+- Model update flow (training pipeline): dashboard triggers `/commands/<node>/training_complete` + `/commands/<node>/update_model` → firmware downloads model via `/model/<node>` + `/params/<node>`.
+- Manual model push: `push_model.py` uses `/commands/<node>/load_model` and server-side model store.
+- Observability: `status` + `perf_bin` topics are used for UI state and performance monitoring.
+
+---
+
+## How to use the MQTT flow with this repo
+
+1. Start Mosquitto and verify `MQTT_BROKER`/`MQTT_PORT`.
+2. Run `python server.py`, then `python dashboard.py`.
+3. Set `RACK_ID` in `.env` to match `CSI Node Configuration` in ESP32 firmware.
+4. Invoke collection with `python trigger_collect.py` (or via dashboard UI).
+5. Observe CSI upload progress and model training status in dashboard.
+6. Check `mosquitto_sub -t "/sensors/+/status" -v` for real-time status streams.
 - If the ESP32 log shows errors like `esp-tls: couldn't get hostname for :192.168.X.X`
   or `Cannot publish, MQTT not connected`, the URI parsing may have failed.
   You can avoid this by specifying the broker as host/port instead of
