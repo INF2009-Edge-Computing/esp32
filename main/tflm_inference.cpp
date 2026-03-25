@@ -8,7 +8,6 @@
 extern "C" {
 #include "esp_timer.h"
 }
-
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -448,7 +447,6 @@ bool tflm_get_inference_profile(tflm_inference_profile_t *out_profile) {
 void tflm_reset_inference_profile(void) {
     reset_invoke_profile_internal();
 }
-
 void tflm_reset(void) {
     if (g_interpreter) {
         delete g_interpreter;

@@ -30,6 +30,7 @@ void tflm_reset_inference_profile(void);
 
 size_t tflm_input_element_count(void);
 void tflm_reset(void);
+
 const char *tflm_last_error(void);
 
 #ifdef __cplusplus

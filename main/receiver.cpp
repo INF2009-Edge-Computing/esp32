@@ -3,6 +3,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <assert.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -440,6 +441,105 @@ static int raw_index_for_subcarrier(int sc)
         return sc - MAX_LOWER;
     }
     return sc - MAX_LOWER - 1;
+}
+
+static bool parse_feature_column_subcarrier(const char *name, int *out_sc)
+{
+    if (!name || !out_sc || strncmp(name, "SC_", 3) != 0) {
+        return false;
+    }
+
+    char *endptr = NULL;
+    long parsed = strtol(name + 3, &endptr, 10);
+    if (endptr == name + 3 || *endptr != '\0') {
+        return false;
+    }
+    int sc = (int)parsed;
+    int raw_idx = raw_index_for_subcarrier(sc);
+    if (raw_idx < 0 || raw_idx >= ACTIVE_SUBCARRIERS) {
+        return false;
+    }
+
+    *out_sc = sc;
+    return true;
+}
+
+static bool infer_feature_layout_from_feature_columns(cJSON *feature_columns_arr, int feature_count)
+{
+    if (!cJSON_IsArray(feature_columns_arr) || feature_count <= 1) {
+        return false;
+    }
+
+    if (cJSON_GetArraySize(feature_columns_arr) != feature_count) {
+        return false;
+    }
+
+    bool looks_grouped = true;
+    bool looks_notebook = true;
+    int parsed_subcarriers[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+    int parsed_raw_indices[MAX_MODEL_FEATURES_PER_FRAME] = {0};
+
+    for (int i = 0; i < feature_count; i++) {
+        cJSON *item = cJSON_GetArrayItem(feature_columns_arr, i);
+        if (!cJSON_IsString(item) || !item->valuestring) {
+            return false;
+        }
+
+        const char *col = item->valuestring;
+        if (i < feature_count - 1) {
+            if (strncmp(col, "GROUP_", 6) != 0) {
+                looks_grouped = false;
+            }
+            if (strncmp(col, "SC_", 3) != 0) {
+                looks_notebook = false;
+            }
+        } else {
+            if (strcmp(col, "AVG_VARIATION") != 0) {
+                looks_grouped = false;
+                looks_notebook = false;
+            }
+        }
+    }
+
+    if (looks_grouped) {
+        grouped_mode_enabled = true;
+        grouped_feature_count = (size_t)(feature_count - 1);
+        notebook_mode_enabled = false;
+        selected_subcarrier_count = 0;
+        return true;
+    }
+
+    if (looks_notebook) {
+        for (int i = 0; i < feature_count - 1; i++) {
+            cJSON *item = cJSON_GetArrayItem(feature_columns_arr, i);
+            if (!cJSON_IsString(item) || !item->valuestring) {
+                return false;
+            }
+
+            int sc = 0;
+            if (!parse_feature_column_subcarrier(item->valuestring, &sc)) {
+                return false;
+            }
+
+            parsed_subcarriers[i] = sc;
+            parsed_raw_indices[i] = raw_index_for_subcarrier(sc);
+            if (parsed_raw_indices[i] < 0) {
+                return false;
+            }
+        }
+
+        for (int i = 0; i < feature_count - 1; i++) {
+            selected_subcarriers[i] = parsed_subcarriers[i];
+            selected_raw_indices[i] = parsed_raw_indices[i];
+        }
+        selected_subcarrier_count = (size_t)(feature_count - 1);
+        notebook_mode_enabled = true;
+        grouped_mode_enabled = false;
+        grouped_feature_count = 0;
+        return true;
+    }
+
+    return false;
 }
 
 static bool is_supported_feature_layout(size_t feature_count)
@@ -1229,6 +1329,7 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
 
     cJSON *mean_arr = cJSON_GetObjectItem(root, "mean");
     cJSON *std_arr = cJSON_GetObjectItem(root, "std");
+    cJSON *feature_columns_arr = cJSON_GetObjectItem(root, "feature_columns");
     if (!cJSON_IsArray(mean_arr) || !cJSON_IsArray(std_arr)) {
         cJSON_Delete(root);
         ESP_LOGE(TAG, "scaler params missing mean/std arrays");
@@ -1362,6 +1463,10 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
                 notebook_mode_enabled = false;
             }
         }
+    }
+
+    if (!notebook_mode_enabled && !grouped_mode_enabled) {
+        (void)infer_feature_layout_from_feature_columns(feature_columns_arr, lim);
     }
 
     if (!notebook_mode_enabled &&
