@@ -24,6 +24,7 @@ extern "C" {
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_heap_caps.h"
+#include "esp_freertos_hooks.h"
 #include "rom/ets_sys.h"
 #include "cJSON.h"
 #include "esp_crc.h"
@@ -166,6 +167,28 @@ static bool model_download_in_progress = false;
 #define PASO_PIPELINE_BUDGET_US 500000
 #define PASO_PERF_PUBLISH_INTERVAL_SAMPLES 50
 
+// CPU Load Tracking via Idle Hook
+static volatile uint64_t g_idle_accumulator_us = 0;
+static uint64_t g_last_load_check_us = 0;
+static float g_cpu_usage_pct = 0.0f;
+
+extern "C" {
+static bool idle_task_hook(void) {
+    static uint64_t last_idle_start = 0;
+    uint64_t now = esp_timer_get_time();
+    if (last_idle_start != 0) {
+        g_idle_accumulator_us += (now - last_idle_start);
+    }
+    last_idle_start = now;
+    return true;
+}
+
+// Low-level FreeRTOS idle hook for some configurations
+void vApplicationIdleHook(void) {
+    idle_task_hook();
+}
+}
+
 static TaskHandle_t status_task_handle = NULL;
 static bool last_published_mqtt_connected = false;
 static bool last_published_model_ready = false;
@@ -210,6 +233,7 @@ typedef struct __attribute__((packed)) {
     int32_t invoke_stage_us;
     int32_t pipeline_total_us;
     uint32_t free_heap;
+    uint32_t largest_block;
 } paso_perf_payload_t;
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
@@ -333,6 +357,7 @@ static void publish_perf_binary_metrics(int64_t queue_wait_us,
     payload.invoke_stage_us = clamp_i64_to_i32(invoke_stage_us);
     payload.pipeline_total_us = clamp_i64_to_i32(pipeline_total_us);
     payload.free_heap = esp_get_free_heap_size();
+    payload.largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
     int msg_id = esp_mqtt_client_publish(mqtt_client,
                                          ESP32_PERF_BIN_TOPIC,
@@ -1848,12 +1873,33 @@ static void vInferenceTask(void *pvParameters)
             int64_t pipeline_total_us = esp_timer_get_time() - pipeline_start_us;
             inference_stage_log_counter++;
             if ((inference_stage_log_counter % PASO_PERF_PUBLISH_INTERVAL_SAMPLES) == 0) {
+                uint32_t free_heap = esp_get_free_heap_size();
+                uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+                uint64_t now_us = esp_timer_get_time();
+                uint64_t wall_time_us = now_us - g_last_load_check_us;
+                uint64_t idle_time_us = g_idle_accumulator_us;
+                
+                // Reset accumulators
+                g_idle_accumulator_us = 0;
+                g_last_load_check_us = now_us;
+
+                if (wall_time_us > 0) {
+                    float usage = 1.0f - ((float)idle_time_us / (float)wall_time_us);
+                    g_cpu_usage_pct = usage * 100.0f;
+                    if (g_cpu_usage_pct < 0.0f) g_cpu_usage_pct = 0.0f;
+                    if (g_cpu_usage_pct > 100.0f) g_cpu_usage_pct = 100.0f;
+                }
+
                 ESP_LOGI(TAG,
-                         "Inference stage_us wait=%" PRIi64 " feature=%" PRIi64 " invoke=%" PRIi64 " total=%" PRIi64,
+                         "Inference stage_us wait=%" PRIi64 " feature=%" PRIi64 " invoke=%" PRIi64 " total=%" PRIi64 " heap=%u block=%u cpu=%.1f%%",
                          dequeue_wait_us,
                          feature_build_us,
                          invoke_stage_us,
-                         pipeline_total_us);
+                         pipeline_total_us,
+                         free_heap,
+                         largest_block,
+                         g_cpu_usage_pct);
                 publish_perf_binary_metrics(dequeue_wait_us,
                                             feature_build_us,
                                             invoke_stage_us,
@@ -2826,6 +2872,9 @@ static void wifi_init_sta(void)
 
 extern "C" void app_main(void)
 {
+    g_last_load_check_us = esp_timer_get_time();
+    esp_register_freertos_idle_hook(idle_task_hook);
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

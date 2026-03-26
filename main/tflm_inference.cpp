@@ -18,7 +18,7 @@ namespace {
 // Lowering it reduces heap pressure at the cost of limiting model complexity.
 // 48 KB has proven sufficient for the current dense model while freeing more
 // heap for HTTP model download buffers on ESP32-C3.
-constexpr int kTensorArenaSize = 48 * 1024;
+constexpr int kTensorArenaSize = 48 * 128;
 alignas(16) static uint8_t g_tensor_arena[kTensorArenaSize];
 
 static const tflite::Model *g_model = nullptr;
@@ -258,6 +258,11 @@ bool tflm_load_model(const unsigned char *model_data, size_t model_size) {
         set_error("AllocateTensors failed");
         return false;
     }
+
+    // Log the actual memory used by the model
+    printf("TFLM: Arena used bytes: %d / %d\n", 
+           (int)g_interpreter->arena_used_bytes(), 
+           (int)kTensorArenaSize);
 
     g_input = g_interpreter->input(0);
     g_output = g_interpreter->output(0);
