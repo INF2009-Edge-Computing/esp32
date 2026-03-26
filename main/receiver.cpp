@@ -32,7 +32,6 @@ extern "C" {
 #include "tflm_inference.h"
 
 // Node / network identity — configure via 'idf.py menuconfig' > CSI Node Configuration
-#define ESP32_ID_STR    CONFIG_CSI_NODE_ID
 #define WIFI_SSID       CONFIG_WIFI_SSID
 #define WIFI_PASS       CONFIG_WIFI_PASS
 #define MQTT_BROKER_URI CONFIG_MQTT_BROKER_URI
@@ -50,13 +49,11 @@ extern "C" {
 #define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
 #define ESP32_PERF_BIN_TOPIC          "/sensors/"  CONFIG_CSI_NODE_ID "/perf_bin"
 #define ESP32_DEVICE_STATUS_TOPIC     "device/" CONFIG_CSI_NODE_ID "/status"
-#define DEFAULT_SCAN_LIST_SIZE 20
 
 /* Define range of subcarriers to use for CSI, ignoring noisy/unused ones */
 #define MAX_LOWER 4
 #define MAX_UPPER 60
 #define DC_NULL 32
-#define NUM_SUBCARRIERS 64
 #define EXPECTED_PERIOD_US 100000 // 10Hz expected period between packets
 
 #define ACTIVE_SUBCARRIERS (MAX_UPPER - MAX_LOWER)
@@ -139,7 +136,7 @@ static bool model_download_in_progress = false;
 // to reduce heap allocations / wakeups.
 #define HEARTBEAT_INTERVAL_MS (60 * 1000) // 1 minute
 #define INFERENCE_QUEUE_DEPTH 16
-#define INFERENCE_DROP_LOG_INTERVAL 100
+#define INFERENCE_DROP_LOG_INTERVAL 1000
 #define CSI_LOG_MIN_INTERVAL_MS 1000
 #define STATE_SMOOTHING_ALPHA 0.85f
 #define STATE_ENTER_THRESHOLD 0.72f
@@ -203,7 +200,6 @@ typedef struct __attribute__((packed)) {
     uint32_t free_heap;
 } paso_perf_payload_t;
 
-static esp_http_client_handle_t client = NULL;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 
 // Cap the exponent to prevent excessive delays (base_ms * 2^exponent).
@@ -229,7 +225,7 @@ static bool publish_with_retry_ex(const char *topic, const char *payload, int qo
         return false;
     }
 
-    const int max_attempts = 5;
+    const int max_attempts = 3;  // Reduced from 5: 60% faster worst-case (1.5s → 0.6s)
     for (int attempt = 0; attempt < max_attempts; attempt++) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, qos, retain ? 1 : 0);
         if (msg_id >= 0) {
@@ -1892,13 +1888,6 @@ static void download_model_and_params_task(void *pvParameters)
         int params_len = 0;
         bool scaler_ok = false;
 
-        // If an upload HTTP client is still around, release it to maximize
-        // available heap before model/scaler download.
-        if (client != NULL) {
-            esp_http_client_cleanup(client);
-            client = NULL;
-        }
-
         ESP_LOGI(TAG, "Model download attempt %d/3: free heap=%u fetching %s and %s", attempt, esp_get_free_heap_size(), HTTP_MODEL_URI, HTTP_PARAMS_URI);
         log_resolved_host(HTTP_MODEL_URI);
         log_resolved_host(HTTP_PARAMS_URI);
@@ -1965,6 +1954,12 @@ static void download_model_and_params_task(void *pvParameters)
                     cJSON_AddNumberToObject(obj, "bytes", (double)model_size);
                     cJSON_AddNumberToObject(obj, "input_elements", (double)model_input_elements);
                     cJSON_AddNumberToObject(obj, "window_size", (double)model_window_size);
+                    cJSON_AddNumberToObject(obj, "feature_count", (double)model_features_per_frame);
+                    cJSON_AddStringToObject(
+                        obj,
+                        "feature_mode",
+                        grouped_mode_enabled ? "grouped" : (notebook_mode_enabled ? "notebook" : "legacy")
+                    );
                     char *json_str = cJSON_PrintUnformatted(obj);
                     if (json_str) {
                         publish_with_retry(ESP32_STATUS_TOPIC, json_str, 1);
@@ -2224,7 +2219,6 @@ static void send_batch_http_task(void *pvParameters)
             }
             cJSON_Delete(msg_obj);
         }
-        ESP_LOGI(TAG, "Free Heap: %" PRIu32 " bytes", esp_get_free_heap_size());
     }
 
     free_http_task_params(params);
@@ -2577,11 +2571,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGE(TAG, "Failed to create model download task");
                 }
             }
-        }
-        break;
-
-    case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT_ERROR event received");
         } else if (mqtt_topic_equals(event, ESP32_RESET_MODEL_TOPIC)) {
             publish_ack("reset_model");
             if (model_download_in_progress) {
@@ -2589,6 +2578,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             } else {
                 clear_loaded_model_runtime("remote_reset", true);
             }
+        }
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT_ERROR event received");
         break;
 
     case MQTT_EVENT_DELETED:

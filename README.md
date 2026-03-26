@@ -243,7 +243,7 @@ The project uses topic templates containing the node ID (e.g., `RACK_1`):
 
 - `/sensors/<node>/status`
   - Firmware publishes status/ack/info.
-  - Values are JSON (`model_ready`, `model_download_armed`, `event`: "ack" | "node_online" ...).
+  - Values are JSON (`model_ready`, `model_download_armed`, `event`: "ack" | "node_online" | "heartbeat" ...).
   - Server/dashboard subscribe for UI updates.
 
 - `/sensors/<node>/perf_bin`
@@ -252,7 +252,17 @@ The project uses topic templates containing the node ID (e.g., `RACK_1`):
     - fields: version, reserved, payload_size, invoke_last_us, invoke_avg_us, invoke_min_us, invoke_max_us, sample_count, queue_wait_us, feature_us, invoke_stage_us, pipeline_total_us, free_heap.
 
 - `device/<node>/status`
-  - Firmware publishes last-will-like status: `"online"` / `"offline"`.
+  - Firmware publishes retained presence status: `"online"` / `"offline"` (QoS 1, retain).
+  - Broker LWT publishes retained `"offline"` on ungraceful disconnect.
+
+### Dashboard liveliness behavior
+
+- Dashboard consumes both retained `device/<node>/status` and `/sensors/<node>/status` heartbeat events.
+- Nodes can show:
+  - `ONLINE` (fresh heartbeat),
+  - `STALE` (heartbeat timeout fallback),
+  - `OFFLINE` (explicit offline or never seen).
+- This improves responsiveness and avoids stale "always connected" indicators.
 
 ### Feature mapping
 
@@ -321,12 +331,10 @@ mosquitto_sub -h 10.198.7.22 -t "/sensors/RACK_1/status" -v
 If you still see nothing, reflash the ESP32 and ensure the broker IP/port are
 correct.
 
-> **Note for Python scripts**: recent `paho-mqtt` releases require passing
-> `callback_api_version=1` when constructing the client.  Older versions
-> defaulted to 1 automatically; if you encounter
-> ``ValueError: Unsupported callback API version: version 2.0`` update the
-> scripts (see `trigger_collect.py`) or install `paho-mqtt==1.6.1` in your
-> virtual environment.
+> **Note for Python scripts**: this repo uses `paho-mqtt==2.x`. Prefer
+> explicit callback API selection:
+> - `mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, ...)` for v2-style callbacks
+> - `mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, ...)` for legacy callback signatures
 
 ---
 
@@ -338,3 +346,21 @@ correct.
 
 Adjust these values to your environment before running.
 
+---
+
+## Feature mode flags (firmware)
+
+`main/receiver.cpp` has two runtime flags that come from `scaler_params.json`:
+
+- `notebook_mode_enabled`
+  - Uses explicit subcarrier features plus `AVG_VARIATION`.
+  - Selected when scaler metadata provides `feature_columns` as concrete `SC_<n>` columns.
+
+- `grouped_mode_enabled`
+  - Uses grouped/condensed features plus one variation feature.
+  - Selected when scaler metadata says `feature_mode=grouped` and provides `group_count`.
+
+If neither mode is selected, firmware falls back to legacy layout handling.
+
+On model load success, firmware now publishes `feature_count` and `feature_mode` in the
+`model_ready` status payload so server/dashboard logs can verify training/firmware alignment.
