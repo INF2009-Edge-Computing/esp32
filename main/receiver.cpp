@@ -30,6 +30,8 @@ extern "C" {
 }
 
 #include "tflm_inference.h"
+#include <vector>
+#include <string>
 
 // Node / network identity — configure via 'idf.py menuconfig' > CSI Node Configuration
 #define WIFI_SSID       CONFIG_WIFI_SSID
@@ -118,6 +120,16 @@ static float last_prediction_probs[3] = {0.3333f, 0.3333f, 0.3333f};
 static float last_csi_mean = 0.0f;
 static float last_csi_max = 0.0f;
 static float smoothed_probs[3] = {0.3333f, 0.3333f, 0.3333f};
+
+static std::vector<std::string> g_label_order;
+
+static const std::string& get_label_for_index(int idx) {
+    static const std::vector<std::string> kDefault = {"door_open","door_closed","person_standing"};
+    if (!g_label_order.empty() && idx >= 0 && idx < (int)g_label_order.size()) return g_label_order[idx];
+    if (idx >= 0 && idx < (int)kDefault.size()) return kDefault[idx];
+    static const std::string unknown = "unknown";
+    return unknown;
+}
 static int stable_state = -1;
 static int pending_state = -1;
 static int pending_count = 0;
@@ -133,8 +145,8 @@ static bool mqtt_connected = false;
 static bool model_download_in_progress = false;
 
 // Status heartbeat task: send only when key state changes (or periodically)
-// to reduce heap allocations / wakeups.
-#define HEARTBEAT_INTERVAL_MS (60 * 1000) // 1 minute
+// Optimized for faster dashboard detection while remaining lightweight.
+#define HEARTBEAT_INTERVAL_MS (15 * 1000) // 15 seconds (4x faster, still minimal overhead)
 #define INFERENCE_QUEUE_DEPTH 16
 #define INFERENCE_DROP_LOG_INTERVAL 1000
 #define CSI_LOG_MIN_INTERVAL_MS 1000
@@ -1041,7 +1053,8 @@ static void publish_hold_event_if_needed(int stable_idx,
     }
     last_hold_publish_us = now;
 
-    static const char *states[3] = {"door_open", "door_closed", "person_standing"};
+    const std::string &held_label = get_label_for_index(stable_idx);
+    const std::string &candidate_label = get_label_for_index(candidate_idx);
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
@@ -1049,8 +1062,8 @@ static void publish_hold_event_if_needed(int stable_idx,
     }
 
     cJSON_AddStringToObject(obj, "event", "state_hold");
-    cJSON_AddStringToObject(obj, "held_state", states[stable_idx]);
-    cJSON_AddStringToObject(obj, "candidate_state", states[candidate_idx]);
+    cJSON_AddStringToObject(obj, "held_state", held_label.c_str());
+    cJSON_AddStringToObject(obj, "candidate_state", candidate_label.c_str());
     cJSON_AddNumberToObject(obj, "confidence", confidence);
     cJSON_AddNumberToObject(obj, "entropy", entropy);
     cJSON_AddNumberToObject(obj, "p_open", probs[0]);
@@ -1494,6 +1507,29 @@ static bool load_scaler_params(const uint8_t *json_buf, int json_len)
              notebook_extract_window_size,
              notebook_calibration_frames);
 
+    // Parse optional label_order array if present
+    cJSON *label_order_arr = cJSON_GetObjectItem(root, "label_order");
+    if (cJSON_IsArray(label_order_arr)) {
+        g_label_order.clear();
+        int lo_sz = cJSON_GetArraySize(label_order_arr);
+        for (int i = 0; i < lo_sz; i++) {
+            cJSON *jl = cJSON_GetArrayItem(label_order_arr, i);
+            if (cJSON_IsString(jl) && jl->valuestring) {
+                g_label_order.push_back(std::string(jl->valuestring));
+            } else {
+                ESP_LOGW(TAG, "label_order contains non-string at index %d", i);
+            }
+        }
+        ESP_LOGI(TAG, "Loaded scaler label_order: %d labels", (int)g_label_order.size());
+        int expected_labels = (int)(sizeof(last_prediction_probs) / sizeof(last_prediction_probs[0]));
+        if ((int)g_label_order.size() != expected_labels) {
+            ESP_LOGW(TAG, "label_order length (%d) doesn't match expected model output size (%d)", (int)g_label_order.size(), expected_labels);
+        }
+    } else {
+        ESP_LOGW(TAG, "scaler params missing label_order; using default label order");
+        g_label_order.clear();
+    }
+
     cJSON_Delete(root);
     return true;
 }
@@ -1555,11 +1591,11 @@ static void publish_state_change(int state_idx)
         return;
     }
 
-    static const char *states[3] = {"door_open", "door_closed", "person_standing"};
+    const std::string &label = get_label_for_index(state_idx);
 
     ESP_LOGI(TAG,
              "state_change => %s (conf=%.2f, smooth=[%.2f, %.2f, %.2f])",
-             states[state_idx],
+             label.c_str(),
              last_prediction_confidence,
              smoothed_probs[0],
              smoothed_probs[1],
@@ -1570,7 +1606,7 @@ static void publish_state_change(int state_idx)
         return;
     }
     cJSON_AddStringToObject(obj, "event", "state_change");
-    cJSON_AddStringToObject(obj, "state", states[state_idx]);
+    cJSON_AddStringToObject(obj, "state", label.c_str());
     cJSON_AddNumberToObject(obj, "confidence", last_prediction_confidence);
     cJSON_AddNumberToObject(obj, "p_open", last_prediction_probs[0]);
     cJSON_AddNumberToObject(obj, "p_closed", last_prediction_probs[1]);
