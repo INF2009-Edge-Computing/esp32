@@ -82,3 +82,4 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 .github/copilot-instructions.md
 
+.vscode/
