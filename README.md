@@ -123,7 +123,8 @@ python broadcast_generator.py
 
 - Model updates do not require reflashing the firmware; the ESP32 downloads the files from the Pi over HTTP.
 - The current model-loading path expects the server to expose `/model/<NODE>` and `/params/<NODE>`.
-- The firmware subscribes to `/commands/<NODE>/collect`, `/commands/<NODE>/training_complete`, and `/commands/<NODE>/load_model`.
+- The firmware subscribes to `/commands/<NODE>/collect`, `/commands/<NODE>/stop_collect`, `/commands/<NODE>/training_complete`, and `/commands/<NODE>/load_model`.
+- `/commands/<NODE>/stop_collect` is the preferred way to stop an active capture. Legacy `collect` payloads with `label=stop` are still accepted during rollout.
 - For the current training pipeline, the feature layout must match the grouped metadata used by `inf2009_proj`.
 - If model loading fails, check the serial monitor for `model_download_incompatible`, `model_download_memory_error`, or `model_download_failed` events.
 - CSI collection relies on real network traffic; `broadcast_generator.py` is only an optional helper for testing.

@@ -49,6 +49,7 @@ extern "C" {
 #define ESP32_TRAINING_COMPLETE_TOPIC "/commands/" CONFIG_CSI_NODE_ID "/training_complete"
 #define ESP32_LOAD_MODEL_TOPIC        "/commands/" CONFIG_CSI_NODE_ID "/load_model"
 #define ESP32_RESET_MODEL_TOPIC       "/commands/" CONFIG_CSI_NODE_ID "/reset_model"
+#define ESP32_STOP_COLLECT_TOPIC      "/commands/" CONFIG_CSI_NODE_ID "/stop_collect"
 #define ESP32_STATUS_TOPIC            "/sensors/"  CONFIG_CSI_NODE_ID "/status"
 #define ESP32_PERF_BIN_TOPIC          "/sensors/"  CONFIG_CSI_NODE_ID "/perf_bin"
 #define ESP32_DEVICE_STATUS_TOPIC     "device/" CONFIG_CSI_NODE_ID "/status"
@@ -79,6 +80,7 @@ static const size_t IDEMPOTENCY_KEY_MAX_LEN = 64;
 static uint8_t packet_idx = 0;
 static uint8_t sub_batch_idx = 0;
 static bool is_collecting = false;
+static volatile bool collection_stop_requested = false;
 static char collection_label[32] = "unknown";
 static char current_session_id[32] = "";
 static uint8_t dynamic_target_mac[6] = {0};
@@ -316,6 +318,19 @@ static void publish_ack(const char *cmd)
         free(json_str);
     }
     cJSON_Delete(obj);
+}
+
+static void stop_current_collection(const char *reason)
+{
+    collection_stop_requested = true;
+    is_collecting = false;
+    packet_idx = 0;
+    sub_batch_idx = 0;
+    memset(csi_buffer, 0, sizeof(csi_buffer));
+    collection_label[0] = '\0';
+    current_session_id[0] = '\0';
+    last_trigger_us = 0;
+    ESP_LOGI(TAG, "Collection stopped (%s)", reason ? reason : "unknown");
 }
 
 static int32_t clamp_i64_to_i32(int64_t value)
@@ -2154,6 +2169,13 @@ static void send_batch_http_task(void *pvParameters)
         return;
     }
 
+    if (collection_stop_requested) {
+        ESP_LOGI(TAG, "Skipping HTTP upload because collection was stopped");
+        free_http_task_params(params);
+        vTaskDelete(NULL);
+        return;
+    }
+
     // Progress tracking headers for server-side assembly of batches
     char sub_batch_str[6];
     snprintf(sub_batch_str, sizeof(sub_batch_str), "%d", params->sub_batch_idx);
@@ -2177,6 +2199,11 @@ static void send_batch_http_task(void *pvParameters)
     int last_http_status = -1;
 
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        if (collection_stop_requested) {
+            ESP_LOGI(TAG, "Aborting HTTP upload retries because collection was stopped");
+            break;
+        }
+
         esp_http_client_config_t config = {};
         config.url = HTTP_UPLOAD_URI;
         config.method = HTTP_METHOD_POST;
@@ -2212,6 +2239,12 @@ static void send_batch_http_task(void *pvParameters)
         uint32_t min_heap_after = esp_get_minimum_free_heap_size();
 
         if (last_err == ESP_OK && is_http_success_status(last_http_status)) {
+            if (collection_stop_requested) {
+                ESP_LOGI(TAG, "Upload finished after stop request; suppressing progress publish");
+                upload_success = false;
+                esp_http_client_cleanup(http_client);
+                break;
+            }
             ESP_LOGI(TAG,
                      "Batch uploaded successfully (%d/%d), HTTP %d (attempt %d/%d) - CSI mean=%.1f max=%.1f",
                      params->sub_batch_idx + 1,
@@ -2240,6 +2273,9 @@ static void send_batch_http_task(void *pvParameters)
         }
 
         bool retryable = should_retry_upload_attempt(last_err, last_http_status);
+        if (collection_stop_requested) {
+            retryable = false;
+        }
         if (last_http_status == 422) {
             ESP_LOGW(TAG,
                      "HTTP 422 (CRC mismatch) for sub-batch %d on attempt %d/%d; retrying",
@@ -2553,46 +2589,72 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                  event->retain,
                  event->dup);
 
-        if (mqtt_topic_equals(event, ESP32_COLLECT_TOPIC)) {
-            publish_ack("collect");
-
-            // Payload may be raw label or JSON {"label":"...","session":"..."}
+        if (mqtt_topic_equals(event, ESP32_STOP_COLLECT_TOPIC)) {
+            publish_ack("stop_collect");
             char payload_buf[256] = {0};
             snprintf(payload_buf, sizeof(payload_buf), "%.*s", event->data_len, event->data);
 
-            collection_label[0] = '\0';
-            current_session_id[0] = '\0';
-
+            const char *reason = "manual_override";
             cJSON *root = cJSON_Parse(payload_buf);
             if (root && cJSON_IsObject(root)) {
-                cJSON *jlabel = cJSON_GetObjectItem(root, "label");
-                if (cJSON_IsString(jlabel) && jlabel->valuestring) {
-                    snprintf(collection_label, sizeof(collection_label), "%s", jlabel->valuestring);
-                }
-
-                cJSON *jsession = cJSON_GetObjectItem(root, "session");
-                if (cJSON_IsString(jsession) && jsession->valuestring) {
-                    snprintf(current_session_id, sizeof(current_session_id), "%s", jsession->valuestring);
+                cJSON *jreason = cJSON_GetObjectItem(root, "reason");
+                if (cJSON_IsString(jreason) && jreason->valuestring) {
+                    reason = jreason->valuestring;
                 }
             }
             cJSON_Delete(root);
 
-            if (!collection_label[0]) {
-                snprintf(collection_label, sizeof(collection_label), "%.*s", event->data_len, event->data);
+            stop_current_collection(reason);
+            notify_status_task();
+        } else if (mqtt_topic_equals(event, ESP32_COLLECT_TOPIC)) {
+            // Payload may be raw label or JSON {"label":"...","session":"..."}
+            char payload_buf[256] = {0};
+            snprintf(payload_buf, sizeof(payload_buf), "%.*s", event->data_len, event->data);
+
+            char parsed_label[32] = {0};
+            char parsed_session[32] = {0};
+            cJSON *root = cJSON_Parse(payload_buf);
+            if (root && cJSON_IsObject(root)) {
+                cJSON *jlabel = cJSON_GetObjectItem(root, "label");
+                if (cJSON_IsString(jlabel) && jlabel->valuestring) {
+                    snprintf(parsed_label, sizeof(parsed_label), "%s", jlabel->valuestring);
+                }
+
+                cJSON *jsession = cJSON_GetObjectItem(root, "session");
+                if (cJSON_IsString(jsession) && jsession->valuestring) {
+                    snprintf(parsed_session, sizeof(parsed_session), "%s", jsession->valuestring);
+                }
             }
-            if (!current_session_id[0]) {
-                int64_t t = esp_timer_get_time();
-                snprintf(current_session_id, sizeof(current_session_id), "%lld", t);
+            cJSON_Delete(root);
+
+            if (!parsed_label[0]) {
+                snprintf(parsed_label, sizeof(parsed_label), "%.*s", event->data_len, event->data);
             }
 
-            packet_idx = 0;
-            sub_batch_idx = 0;
-            is_collecting = true;
-            reset_state_machine();
+            if (strcasecmp(parsed_label, "stop") == 0) {
+                publish_ack("stop_collect");
+                stop_current_collection("legacy_stop");
+                notify_status_task();
+            } else {
+                publish_ack("collect");
+                snprintf(collection_label, sizeof(collection_label), "%s", parsed_label);
+                if (parsed_session[0]) {
+                    snprintf(current_session_id, sizeof(current_session_id), "%s", parsed_session);
+                } else {
+                    int64_t t = esp_timer_get_time();
+                    snprintf(current_session_id, sizeof(current_session_id), "%lld", t);
+                }
 
-            ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)",
-                     collection_label,
-                     current_session_id);
+                collection_stop_requested = false;
+                packet_idx = 0;
+                sub_batch_idx = 0;
+                is_collecting = true;
+                reset_state_machine();
+
+                ESP_LOGI(TAG, "Starting data collection for state: %s (session=%s)",
+                         collection_label,
+                         current_session_id);
+            }
         } else if (mqtt_topic_equals(event, ESP32_TRAINING_COMPLETE_TOPIC)) {
             publish_ack("training_complete");
             model_download_armed = true;
