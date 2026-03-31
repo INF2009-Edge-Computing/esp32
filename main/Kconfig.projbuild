@@ -8,29 +8,104 @@ menu "CSI Node Configuration"
             RACK_ID used in the Pi-side dashboard and server.
 
     config WIFI_SSID
-        string "Wi-Fi SSID"
+        string "Wi-Fi SSID (profile 1)"
         default "Wifi"
         help
-            SSID of the 2.4 GHz access point to connect to.
+            Primary Wi-Fi profile. The firmware scans the configured
+            profiles and connects to the first available match.
 
     config WIFI_PASS
-        string "Wi-Fi Password"
+        string "Wi-Fi Password (profile 1)"
         default ""
         help
             Password for the above SSID. Leave blank for open networks.
 
     config MQTT_BROKER_URI
-        string "MQTT Broker URI"
+        string "MQTT Broker URI (profile 1)"
         default "mqtt://192.168.0.x:1883"
         help
             Full URI of the MQTT broker, e.g. mqtt://192.168.0.22:1883 .
             Must include scheme and port.
 
     config HTTP_SERVER_BASE
-        string "HTTP Server Base URL"
+        string "HTTP Server Base URL (profile 1)"
         default "http://192.168.0.x:5000"
         help
             Base URL of the Pi Flask ingest server (no trailing slash),
             e.g. http://192.168.0.22:5000 .
+
+    config WIFI_SSID_2
+        string "Wi-Fi SSID (profile 2)"
+        default ""
+        help
+            Optional second Wi-Fi profile. Leave blank to disable.
+
+    config WIFI_PASS_2
+        string "Wi-Fi Password (profile 2)"
+        default ""
+        help
+            Password for profile 2.
+
+    config MQTT_BROKER_URI_2
+        string "MQTT Broker URI (profile 2)"
+        default ""
+        help
+            MQTT broker URI for profile 2.
+
+    config HTTP_SERVER_BASE_2
+        string "HTTP Server Base URL (profile 2)"
+        default ""
+        help
+            HTTP server base URL for profile 2.
+
+    config WIFI_SSID_3
+        string "Wi-Fi SSID (profile 3)"
+        default ""
+        help
+            Optional third Wi-Fi profile. Leave blank to disable.
+
+    config WIFI_PASS_3
+        string "Wi-Fi Password (profile 3)"
+        default ""
+        help
+            Password for profile 3.
+
+    config MQTT_BROKER_URI_3
+        string "MQTT Broker URI (profile 3)"
+        default ""
+        help
+            MQTT broker URI for profile 3.
+
+    config HTTP_SERVER_BASE_3
+        string "HTTP Server Base URL (profile 3)"
+        default ""
+        help
+            HTTP server base URL for profile 3.
+
+    config WIFI_SSID_4
+        string "Wi-Fi SSID (profile 4)"
+        default ""
+        help
+            Optional fourth Wi-Fi profile. Leave blank to disable.
+
+    config WIFI_PASS_4
+        string "Wi-Fi Password (profile 4)"
+        default ""
+        help
+            Password for profile 4.
+
+    config MQTT_BROKER_URI_4
+        string "MQTT Broker URI (profile 4)"
+        default ""
+        help
+            MQTT broker URI for profile 4.
+
+    config HTTP_SERVER_BASE_4
+        string "HTTP Server Base URL (profile 4)"
+        default ""
+        help
+            HTTP server base URL for profile 4.
+
+    comment "The firmware probes each selected HTTP base at /health before using it."
 
 endmenu

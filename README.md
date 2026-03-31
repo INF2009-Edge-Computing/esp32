@@ -10,7 +10,7 @@ This repository is the device-side half of the system. It pairs with `inf2009_pr
 | --- | --- |
 | `main/receiver.cpp` | Core firmware: Wi-Fi, MQTT, CSI capture, feature extraction, inference, and HTTP upload |
 | `main/tflm_inference.cpp` / `main/tflm_inference.h` | TensorFlow Lite Micro model loading and prediction helpers |
-| `main/Kconfig.projbuild` | Firmware configuration menu for node ID, Wi-Fi, MQTT broker, and HTTP server base URL |
+| `main/Kconfig.projbuild` | Firmware configuration menu for node ID plus up to four Wi-Fi/MQTT/HTTP profiles |
 | `CMakeLists.txt` | ESP-IDF project entry point |
 | `sdkconfig` / `sdkconfig.defaults` | Build configuration and defaults for ESP-IDF |
 | `trigger_collect.py` | MQTT helper that publishes a collect command |
@@ -70,10 +70,10 @@ idf.py menuconfig
 Set the CSI node configuration values to match your environment:
 
 - `CSI_NODE_ID`
-- `WIFI_SSID`
-- `WIFI_PASS`
-- `MQTT_BROKER_URI`
-- `HTTP_SERVER_BASE`
+- `WIFI_SSID` / `WIFI_PASS` / `MQTT_BROKER_URI` / `HTTP_SERVER_BASE`
+- optional fallback profiles `WIFI_SSID_2` ... `WIFI_SSID_4` with matching broker/base URL values
+
+The firmware scans visible Wi-Fi networks, picks the first configured profile it can actually use, and only accepts a profile after the Pi server answers on `/health` and the existing MQTT model-load flow succeeds.
 
 If you change any MQTT topic names or the feature layout, update both repositories together.
 
@@ -123,6 +123,7 @@ python broadcast_generator.py
 
 - Model updates do not require reflashing the firmware; the ESP32 downloads the files from the Pi over HTTP.
 - The current model-loading path expects the server to expose `/model/<NODE>` and `/params/<NODE>`.
+- The Pi server also exposes `/health`; the firmware uses it during profile selection to verify the chosen HTTP endpoint before settling on that network.
 - The firmware subscribes to `/commands/<NODE>/collect`, `/commands/<NODE>/stop_collect`, `/commands/<NODE>/training_complete`, and `/commands/<NODE>/load_model`.
 - `/commands/<NODE>/stop_collect` is the preferred way to stop an active capture. Legacy `collect` payloads with `label=stop` are still accepted during rollout.
 - For the current training pipeline, the feature layout must match the grouped metadata used by `inf2009_proj`.

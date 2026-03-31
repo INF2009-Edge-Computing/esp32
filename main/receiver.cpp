@@ -31,17 +31,412 @@ extern "C" {
 }
 
 #include "tflm_inference.h"
+#include <algorithm>
+#include <utility>
 #include <vector>
 #include <string>
 
+static const char *TAG = "logger";
+
 // Node / network identity — configure via 'idf.py menuconfig' > CSI Node Configuration
-#define WIFI_SSID       CONFIG_WIFI_SSID
-#define WIFI_PASS       CONFIG_WIFI_PASS
-#define MQTT_BROKER_URI CONFIG_MQTT_BROKER_URI
-#define HTTP_SERVER_BASE CONFIG_HTTP_SERVER_BASE
-#define HTTP_UPLOAD_URI  CONFIG_HTTP_SERVER_BASE "/upload_data"
-#define HTTP_MODEL_URI   CONFIG_HTTP_SERVER_BASE "/model/" CONFIG_CSI_NODE_ID
-#define HTTP_PARAMS_URI  CONFIG_HTTP_SERVER_BASE "/params/" CONFIG_CSI_NODE_ID
+#define MAX_NETWORK_PROFILES 4
+#define PROFILE_URL_BUFFER_SIZE 256
+#define MQTT_BROKER_URI_BUFFER_SIZE 192
+
+typedef struct {
+    const char *name;
+    const char *ssid;
+    const char *password;
+    const char *mqtt_broker_uri;
+    const char *http_server_base;
+} network_profile_t;
+
+static const network_profile_t kConfiguredProfiles[MAX_NETWORK_PROFILES] = {
+    {
+        "profile_1",
+        CONFIG_WIFI_SSID,
+        CONFIG_WIFI_PASS,
+        CONFIG_MQTT_BROKER_URI,
+        CONFIG_HTTP_SERVER_BASE,
+    },
+    {
+        "profile_2",
+        CONFIG_WIFI_SSID_2,
+        CONFIG_WIFI_PASS_2,
+        CONFIG_MQTT_BROKER_URI_2,
+        CONFIG_HTTP_SERVER_BASE_2,
+    },
+    {
+        "profile_3",
+        CONFIG_WIFI_SSID_3,
+        CONFIG_WIFI_PASS_3,
+        CONFIG_MQTT_BROKER_URI_3,
+        CONFIG_HTTP_SERVER_BASE_3,
+    },
+    {
+        "profile_4",
+        CONFIG_WIFI_SSID_4,
+        CONFIG_WIFI_PASS_4,
+        CONFIG_MQTT_BROKER_URI_4,
+        CONFIG_HTTP_SERVER_BASE_4,
+    },
+};
+
+static const network_profile_t *g_active_profile = NULL;
+static int g_active_profile_index = -1;
+static char g_active_http_upload_url[PROFILE_URL_BUFFER_SIZE] = "";
+static char g_active_http_model_url[PROFILE_URL_BUFFER_SIZE] = "";
+static char g_active_http_params_url[PROFILE_URL_BUFFER_SIZE] = "";
+static char g_active_http_health_url[PROFILE_URL_BUFFER_SIZE] = "";
+static char g_active_mqtt_broker_uri[MQTT_BROKER_URI_BUFFER_SIZE] = "";
+static int g_wifi_retry_limit = 5;
+static bool g_wifi_should_autoconnect = false;
+static bool g_profile_validation_mode = false;
+static EventGroupHandle_t wifi_event_group = NULL;
+static EventGroupHandle_t mqtt_event_group = NULL;
+static uint8_t s_retry_num = 0;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+#define MQTT_CONNECTED_BIT BIT2
+#define MQTT_FAIL_BIT BIT3
+#define MODEL_DOWNLOAD_OK_BIT BIT4
+#define MODEL_DOWNLOAD_FAIL_BIT BIT5
+
+static const char *get_active_http_upload_url(void) {
+    return g_active_http_upload_url[0] ? g_active_http_upload_url : NULL;
+}
+
+static const char *get_active_http_model_url(void) {
+    return g_active_http_model_url[0] ? g_active_http_model_url : NULL;
+}
+
+static const char *get_active_http_params_url(void) {
+    return g_active_http_params_url[0] ? g_active_http_params_url : NULL;
+}
+
+static const char *get_active_http_health_url(void) {
+    return g_active_http_health_url[0] ? g_active_http_health_url : NULL;
+}
+
+static const char *get_active_mqtt_broker_uri(void) {
+    return g_active_mqtt_broker_uri[0] ? g_active_mqtt_broker_uri : NULL;
+}
+
+static const char *get_active_profile_name(void) {
+    return (g_active_profile != NULL && g_active_profile_index >= 0) ? g_active_profile->name : "unselected";
+}
+
+static const char *get_device_status_topic(void)
+{
+    static char topic[64];
+    if (topic[0] == '\0') {
+        snprintf(topic, sizeof(topic), "device/%s/status", CONFIG_CSI_NODE_ID);
+    }
+    return topic;
+}
+
+static const char *get_load_model_topic(void)
+{
+    static char topic[64];
+    if (topic[0] == '\0') {
+        snprintf(topic, sizeof(topic), "/commands/%s/load_model", CONFIG_CSI_NODE_ID);
+    }
+    return topic;
+}
+
+static bool profile_has_required_fields(const network_profile_t *profile)
+{
+    return profile != NULL &&
+           profile->ssid != NULL &&
+           profile->ssid[0] != '\0' &&
+           profile->mqtt_broker_uri != NULL &&
+           profile->mqtt_broker_uri[0] != '\0' &&
+           profile->http_server_base != NULL &&
+           profile->http_server_base[0] != '\0';
+}
+
+static bool build_profile_url(const char *base, const char *suffix, char *out, size_t out_size)
+{
+    if (base == NULL || suffix == NULL || out == NULL || out_size == 0) {
+        return false;
+    }
+
+    size_t base_len = strlen(base);
+    while (base_len > 0 && base[base_len - 1] == '/') {
+        base_len--;
+    }
+
+    int written = snprintf(out, out_size, "%.*s%s", (int)base_len, base, suffix);
+    return written > 0 && written < (int)out_size;
+}
+
+static bool profile_is_configured(const network_profile_t *profile)
+{
+    return profile_has_required_fields(profile);
+}
+
+static void clear_loaded_model_runtime(const char *reason, bool publish_event);
+static void download_model_and_params_task(void *pvParameters);
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+
+static bool activate_profile(int profile_index, const network_profile_t *profile)
+{
+    if (profile_index < 0 || profile_index >= MAX_NETWORK_PROFILES || !profile_has_required_fields(profile)) {
+        return false;
+    }
+
+    if (!build_profile_url(profile->http_server_base, "/upload_data", g_active_http_upload_url, sizeof(g_active_http_upload_url)) ||
+        !build_profile_url(profile->http_server_base, "/model/" CONFIG_CSI_NODE_ID, g_active_http_model_url, sizeof(g_active_http_model_url)) ||
+        !build_profile_url(profile->http_server_base, "/params/" CONFIG_CSI_NODE_ID, g_active_http_params_url, sizeof(g_active_http_params_url)) ||
+        !build_profile_url(profile->http_server_base, "/health", g_active_http_health_url, sizeof(g_active_http_health_url))) {
+        ESP_LOGE(TAG, "Failed to build active HTTP URLs for %s", profile->name ? profile->name : "unknown");
+        return false;
+    }
+
+    int written = snprintf(g_active_mqtt_broker_uri,
+                           sizeof(g_active_mqtt_broker_uri),
+                           "%s",
+                           profile->mqtt_broker_uri);
+    if (written <= 0 || written >= (int)sizeof(g_active_mqtt_broker_uri)) {
+        ESP_LOGE(TAG, "Failed to store active MQTT broker URI for %s", profile->name ? profile->name : "unknown");
+        return false;
+    }
+
+    g_active_profile = profile;
+    g_active_profile_index = profile_index;
+    ESP_LOGI(TAG,
+             "Active profile selected: %s (ssid=%s broker=%s base=%s)",
+             get_active_profile_name(),
+             profile->ssid,
+             g_active_mqtt_broker_uri,
+             profile->http_server_base);
+    return true;
+}
+
+static void clear_active_profile(void)
+{
+    g_active_profile = NULL;
+    g_active_profile_index = -1;
+    g_active_http_upload_url[0] = '\0';
+    g_active_http_model_url[0] = '\0';
+    g_active_http_params_url[0] = '\0';
+    g_active_http_health_url[0] = '\0';
+    g_active_mqtt_broker_uri[0] = '\0';
+}
+
+#define WIFI_SSID (g_active_profile ? g_active_profile->ssid : "")
+#define WIFI_PASS (g_active_profile ? g_active_profile->password : "")
+#define MQTT_BROKER_URI (get_active_mqtt_broker_uri())
+#define HTTP_SERVER_BASE (g_active_profile ? g_active_profile->http_server_base : "")
+#define HTTP_UPLOAD_URI (get_active_http_upload_url())
+#define HTTP_MODEL_URI (get_active_http_model_url())
+#define HTTP_PARAMS_URI (get_active_http_params_url())
+#define HTTP_HEALTH_URI (get_active_http_health_url())
+
+static bool http_health_check(const char *url)
+{
+    if (url == NULL || url[0] == '\0') {
+        return false;
+    }
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 4000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGW(TAG, "HTTP health client init failed for %s", url);
+        return false;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 400) {
+        ESP_LOGW(TAG, "HTTP health check failed for %s err=%s status=%d", url, esp_err_to_name(err), status);
+        return false;
+    }
+
+    return true;
+}
+
+static bool wifi_connect_profile(const network_profile_t *profile, int profile_index)
+{
+    if (!profile_is_configured(profile)) {
+        return false;
+    }
+
+    clear_active_profile();
+    if (!activate_profile(profile_index, profile)) {
+        return false;
+    }
+
+    wifi_config_t wifi_config = {};
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    const char *password = (profile->password != NULL) ? profile->password : "";
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", profile->ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", password);
+    wifi_config.sta.threshold.authmode = (password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config.sta.listen_interval = 1;
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set WiFi config for %s: %s", profile->name, esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start WiFi connect for %s: %s", profile->name, esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Configured WiFi profile %s (SSID=%s)", profile->name, profile->ssid);
+    return true;
+}
+
+static std::vector<int> build_profile_candidates(const std::vector<wifi_ap_record_t> &aps)
+{
+    std::vector<std::pair<int, int>> scored;
+
+    for (int i = 0; i < MAX_NETWORK_PROFILES; i++) {
+        const network_profile_t &profile = kConfiguredProfiles[i];
+        if (!profile_is_configured(&profile)) {
+            continue;
+        }
+
+        int best_rssi = INT_MIN;
+        for (const auto &ap : aps) {
+            if (strncmp((const char *)ap.ssid, profile.ssid, sizeof(ap.ssid)) == 0) {
+                best_rssi = std::max(best_rssi, (int)ap.rssi);
+            }
+        }
+
+        if (best_rssi != INT_MIN) {
+            scored.emplace_back(i, best_rssi);
+        }
+    }
+
+    std::sort(scored.begin(), scored.end(), [](const auto &lhs, const auto &rhs) {
+        if (lhs.second != rhs.second) {
+            return lhs.second > rhs.second;
+        }
+        return lhs.first < rhs.first;
+    });
+
+    std::vector<int> ordered;
+    ordered.reserve(scored.size());
+    for (const auto &item : scored) {
+        ordered.push_back(item.first);
+    }
+
+    return ordered;
+}
+
+static bool connect_mqtt_for_active_profile(void)
+{
+    const char *broker_uri = get_active_mqtt_broker_uri();
+    if (!profile_is_configured(g_active_profile) || broker_uri == NULL || broker_uri[0] == '\0') {
+        ESP_LOGW(TAG, "No active MQTT broker configured");
+        return false;
+    }
+
+    if (mqtt_event_group == NULL) {
+        mqtt_event_group = xEventGroupCreate();
+        if (mqtt_event_group == NULL) {
+            ESP_LOGE(TAG, "Failed to create MQTT event group");
+            return false;
+        }
+    }
+
+    xEventGroupClearBits(mqtt_event_group,
+                         MQTT_CONNECTED_BIT | MQTT_FAIL_BIT |
+                         MODEL_DOWNLOAD_OK_BIT | MODEL_DOWNLOAD_FAIL_BIT);
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = broker_uri;
+    mqtt_cfg.session.keepalive = 30;
+    const char *device_topic = get_device_status_topic();
+    mqtt_cfg.session.last_will.topic = device_topic;
+    mqtt_cfg.session.last_will.msg = "offline";
+    mqtt_cfg.session.last_will.msg_len = 7;
+    mqtt_cfg.session.last_will.qos = 1;
+    mqtt_cfg.session.last_will.retain = 1;
+
+    esp_mqtt_client_handle_t client_handle = esp_mqtt_client_init(&mqtt_cfg);
+    if (client_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client for %s", broker_uri);
+        return false;
+    }
+
+    esp_mqtt_client_register_event(client_handle,
+                                   (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler,
+                                   NULL);
+    g_profile_validation_mode = true;
+    esp_mqtt_client_start(client_handle);
+
+    EventBits_t bits = xEventGroupWaitBits(mqtt_event_group,
+                                           MQTT_CONNECTED_BIT | MQTT_FAIL_BIT,
+                                           pdTRUE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(10000));
+    if ((bits & MQTT_CONNECTED_BIT) == 0) {
+        ESP_LOGW(TAG, "MQTT connection failed for broker=%s", broker_uri);
+        esp_mqtt_client_stop(client_handle);
+        esp_mqtt_client_destroy(client_handle);
+        mqtt_connected = false;
+        mqtt_client = NULL;
+        g_profile_validation_mode = false;
+        return false;
+    }
+
+    if (!http_health_check(HTTP_HEALTH_URI)) {
+        ESP_LOGW(TAG, "HTTP health check failed for profile %s", get_active_profile_name());
+        esp_mqtt_client_stop(client_handle);
+        esp_mqtt_client_destroy(client_handle);
+        mqtt_connected = false;
+        mqtt_client = NULL;
+        g_profile_validation_mode = false;
+        return false;
+    }
+
+    mqtt_client = client_handle;
+    mqtt_connected = true;
+    if (!publish_with_retry(get_load_model_topic(), "", 1)) {
+        ESP_LOGW(TAG, "Failed to publish load_model validation command for broker=%s", broker_uri);
+        esp_mqtt_client_stop(client_handle);
+        esp_mqtt_client_destroy(client_handle);
+        mqtt_connected = false;
+        mqtt_client = NULL;
+        g_profile_validation_mode = false;
+        return false;
+    }
+
+    EventBits_t model_bits = xEventGroupWaitBits(mqtt_event_group,
+                                                 MODEL_DOWNLOAD_OK_BIT | MODEL_DOWNLOAD_FAIL_BIT,
+                                                 pdTRUE,
+                                                 pdFALSE,
+                                                 pdMS_TO_TICKS(30000));
+    if ((model_bits & MODEL_DOWNLOAD_OK_BIT) == 0) {
+        ESP_LOGW(TAG, "Model validation failed for broker=%s", broker_uri);
+        esp_mqtt_client_stop(client_handle);
+        esp_mqtt_client_destroy(client_handle);
+        mqtt_connected = false;
+        mqtt_client = NULL;
+        g_profile_validation_mode = false;
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "Network profile ready: %s (SSID=%s broker=%s)",
+             get_active_profile_name(),
+             g_active_profile ? g_active_profile->ssid : "",
+             broker_uri);
+    g_profile_validation_mode = false;
+    return true;
+}
 
 // MQTT topic construction uses the node ID string from Kconfig
 #define ESP32_COLLECT_TOPIC           "/commands/" CONFIG_CSI_NODE_ID "/collect"
@@ -85,7 +480,6 @@ static char collection_label[32] = "unknown";
 static char current_session_id[32] = "";
 static uint8_t dynamic_target_mac[6] = {0};
 
-static const char *TAG = "logger";
 static uint8_t *model_buffer = NULL;
 static size_t model_size = 0;
 static bool model_ready = false;
@@ -1120,6 +1514,10 @@ static void publish_hold_event_if_needed(int stable_idx,
 
 static void log_resolved_host(const char *url)
 {
+    if (url == NULL || url[0] == '\0') {
+        return;
+    }
+
     const char *p = strstr(url, "://");
     if (p) {
         p += 3;
@@ -1183,6 +1581,16 @@ static esp_err_t http_get_buffer(const char *url,
 {
     *out_buf = NULL;
     *out_len = 0;
+
+    if (url == NULL || url[0] == '\0') {
+        publish_model_download_memory_error(asset,
+                                            "missing_url",
+                                            url,
+                                            0,
+                                            attempt,
+                                            ESP_ERR_INVALID_ARG);
+        return ESP_FAIL;
+    }
 
     esp_http_client_config_t config = {};
     config.url = url;
@@ -1978,6 +2386,19 @@ static void download_model_and_params_task(void *pvParameters)
     // frees RAM and avoids leaving stale model state in place.
     clear_loaded_model_runtime("pre_download", false);
 
+    char model_url[PROFILE_URL_BUFFER_SIZE] = "";
+    char params_url[PROFILE_URL_BUFFER_SIZE] = "";
+    const char *active_model_url = HTTP_MODEL_URI;
+    const char *active_params_url = HTTP_PARAMS_URI;
+    if (active_model_url != NULL) {
+        snprintf(model_url, sizeof(model_url), "%s", active_model_url);
+    }
+    if (active_params_url != NULL) {
+        snprintf(params_url, sizeof(params_url), "%s", active_params_url);
+    }
+    const char *model_url_log = (model_url[0] != '\0') ? model_url : "<unset>";
+    const char *params_url_log = (params_url[0] != '\0') ? params_url : "<unset>";
+
     for (int attempt = 1; attempt <= 3; attempt++) {
         uint8_t *downloaded_model = NULL;
         uint8_t *downloaded_params = NULL;
@@ -1985,20 +2406,25 @@ static void download_model_and_params_task(void *pvParameters)
         int params_len = 0;
         bool scaler_ok = false;
 
-        ESP_LOGI(TAG, "Model download attempt %d/3: free heap=%u fetching %s and %s", attempt, esp_get_free_heap_size(), HTTP_MODEL_URI, HTTP_PARAMS_URI);
-        log_resolved_host(HTTP_MODEL_URI);
-        log_resolved_host(HTTP_PARAMS_URI);
+        ESP_LOGI(TAG,
+                 "Model download attempt %d/3: free heap=%u fetching %s and %s",
+                 attempt,
+                 esp_get_free_heap_size(),
+                 model_url_log,
+                 params_url_log);
+        log_resolved_host(model_url);
+        log_resolved_host(params_url);
 
         // Download and parse scaler first, then free it before model download
         // to lower peak RAM pressure.
-        esp_err_t e2 = http_get_buffer(HTTP_PARAMS_URI, &downloaded_params, &params_len, "scaler", attempt);
+        esp_err_t e2 = http_get_buffer(params_url, &downloaded_params, &params_len, "scaler", attempt);
         if (e2 == ESP_OK) {
             scaler_ok = load_scaler_params(downloaded_params, params_len);
             free(downloaded_params);
             downloaded_params = NULL;
         }
 
-        esp_err_t e1 = http_get_buffer(HTTP_MODEL_URI, &downloaded_model, &model_len, "model", attempt);
+        esp_err_t e1 = http_get_buffer(model_url, &downloaded_model, &model_len, "model", attempt);
 
         ESP_LOGI(TAG,
                  "Download results: model err=%s len=%d, params err=%s len=%d scaler_ok=%d largest_block=%u",
@@ -2067,6 +2493,9 @@ static void download_model_and_params_task(void *pvParameters)
 
                 ESP_LOGI(TAG, "Model/scaler downloaded (%d bytes)", model_len);
                 model_download_in_progress = false;
+                if (mqtt_event_group != NULL) {
+                    xEventGroupSetBits(mqtt_event_group, MODEL_DOWNLOAD_OK_BIT);
+                }
                 vTaskDelete(NULL);
                 return;
             }
@@ -2103,6 +2532,9 @@ static void download_model_and_params_task(void *pvParameters)
     }
 
     model_download_in_progress = false;
+    if (mqtt_event_group != NULL) {
+        xEventGroupSetBits(mqtt_event_group, MODEL_DOWNLOAD_FAIL_BIT);
+    }
     vTaskDelete(NULL);
 }
 
@@ -2193,6 +2625,12 @@ static void send_batch_http_task(void *pvParameters)
     const char *session_for_headers = (params->session_id[0] != '\0') ? params->session_id : "nosession";
     snprintf(idem_key, sizeof(idem_key), "%s_%d", session_for_headers, params->sub_batch_idx);
 
+    char upload_url[PROFILE_URL_BUFFER_SIZE] = "";
+    const char *active_upload_url = HTTP_UPLOAD_URI;
+    if (active_upload_url != NULL) {
+        snprintf(upload_url, sizeof(upload_url), "%s", active_upload_url);
+    }
+
     const int max_attempts = 4; // initial + 3 retries
     bool upload_success = false;
     esp_err_t last_err = ESP_FAIL;
@@ -2204,8 +2642,15 @@ static void send_batch_http_task(void *pvParameters)
             break;
         }
 
+        if (upload_url[0] == '\0') {
+            ESP_LOGE(TAG, "HTTP upload URL is not configured for the active profile");
+            last_err = ESP_ERR_INVALID_ARG;
+            last_http_status = -1;
+            break;
+        }
+
         esp_http_client_config_t config = {};
-        config.url = HTTP_UPLOAD_URI;
+        config.url = upload_url;
         config.method = HTTP_METHOD_POST;
 
         esp_http_client_handle_t http_client = esp_http_client_init(&config);
@@ -2524,7 +2969,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_BEFORE_CONNECT:
         break;
     case MQTT_EVENT_CONNECTED: {
-        ESP_LOGI(TAG, "MQTT Connected (broker=%s)", MQTT_BROKER_URI);
+        const char *connected_broker_uri = get_active_mqtt_broker_uri();
+        ESP_LOGI(TAG, "MQTT Connected (broker=%s)",
+                 connected_broker_uri != NULL ? connected_broker_uri : "<unset>");
+        if (mqtt_event_group != NULL) {
+            xEventGroupSetBits(mqtt_event_group, MQTT_CONNECTED_BIT);
+        }
         int lwt_online_msg_id = esp_mqtt_client_publish(event->client,
                                                         ESP32_DEVICE_STATUS_TOPIC,
                                                         "online",
@@ -2546,7 +2996,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         notify_status_task();
 
         // Auto-reload model on reconnect (since RAM is cleared on reset)
-        if (auto_load_model_on_reconnect && !model_ready && !model_download_in_progress) {
+        if (!g_profile_validation_mode && auto_load_model_on_reconnect && !model_ready && !model_download_in_progress) {
             ESP_LOGI(TAG, "Auto-loading model on MQTT reconnect");
             model_download_in_progress = true;
             if (xTaskCreate(download_model_and_params_task,
@@ -2557,6 +3007,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             NULL) != pdPASS) {
                 model_download_in_progress = false;
                 ESP_LOGE(TAG, "Failed to create auto model download task");
+                if (mqtt_event_group != NULL) {
+                    xEventGroupSetBits(mqtt_event_group, MODEL_DOWNLOAD_FAIL_BIT);
+                }
             }
         }
     } break;
@@ -2566,6 +3019,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         mqtt_connected = false;
         // Avoid publish attempts while disconnected; broker LWT advertises offline.
         mqtt_client = NULL;
+        if (mqtt_event_group != NULL) {
+            xEventGroupSetBits(mqtt_event_group, MQTT_FAIL_BIT);
+        }
         notify_status_task();
         break;
 
@@ -2742,33 +3198,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-// WiFi event handler moved to file scope
-static EventGroupHandle_t wifi_event_group;
-static uint8_t s_retry_num = 0;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "WIFI_EVENT_STA_START received, connecting...");
-        esp_wifi_connect();
+        if (g_wifi_should_autoconnect) {
+            esp_wifi_connect();
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "WIFI_EVENT_STA_DISCONNECTED received");
-        if (s_retry_num < 5) {
+        wifi_connected = false;
+        if (g_wifi_should_autoconnect && s_retry_num < g_wifi_retry_limit) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "Retrying to connect to the AP (%d/5)", s_retry_num);
+            ESP_LOGI(TAG, "Retrying to connect to the AP (%d/%d)", s_retry_num, g_wifi_retry_limit);
         } else {
-            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+            if (wifi_event_group != NULL) {
+                xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+            }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP received, IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        if (wifi_event_group != NULL) {
+            xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        }
         wifi_connected = true;
 
         wifi_ap_record_t ap_info;
@@ -2853,46 +3310,123 @@ static void wifi_init_sta(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    wifi_config_t wifi_config = {};
-    memset(&wifi_config, 0, sizeof(wifi_config));
-    memcpy(wifi_config.sta.ssid, WIFI_SSID, strlen(WIFI_SSID));
-    memcpy(wifi_config.sta.password, WIFI_PASS, strlen(WIFI_PASS));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.listen_interval = 1;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", WIFI_SSID);
-
-    wifi_event_group = xEventGroupCreate();
-    s_retry_num = 0;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &event_handler,
                                                         NULL,
                                                         NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        NULL));
+                                                         IP_EVENT_STA_GOT_IP,
+                                                         &event_handler,
+                                                         NULL,
+                                                         NULL));
 
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdTRUE,
-                                           pdFALSE,
-                                           pdMS_TO_TICKS(15000));
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to AP: %s", WIFI_SSID);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID: %s", WIFI_SSID);
-    } else {
-        ESP_LOGW(TAG, "WiFi connection TIMEOUT or UNKNOWN EVENT");
+    bool connected = false;
+    while (!connected) {
+        std::vector<int> candidate_indexes;
+        std::vector<wifi_ap_record_t> scan_results;
+
+        wifi_scan_config_t scan_config = {};
+        scan_config.ssid = NULL;
+        scan_config.bssid = NULL;
+        scan_config.channel = 0;
+        scan_config.show_hidden = true;
+
+        esp_err_t scan_err = esp_wifi_scan_start(&scan_config, true);
+        if (scan_err != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(scan_err));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        uint16_t ap_count = 0;
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+        if (ap_count > 0) {
+            scan_results.resize(ap_count);
+            uint16_t actual_count = ap_count;
+            ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&actual_count, scan_results.data()));
+            scan_results.resize(actual_count);
+        }
+
+        candidate_indexes = build_profile_candidates(scan_results);
+        if (candidate_indexes.empty()) {
+            ESP_LOGW(TAG, "No configured Wi-Fi profiles matched visible access points");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        for (int profile_index : candidate_indexes) {
+            const network_profile_t &profile = kConfiguredProfiles[profile_index];
+            if (!profile_is_configured(&profile)) {
+                continue;
+            }
+
+            if (wifi_event_group != NULL) {
+                vEventGroupDelete(wifi_event_group);
+                wifi_event_group = NULL;
+            }
+
+            wifi_event_group = xEventGroupCreate();
+            if (wifi_event_group == NULL) {
+                ESP_LOGE(TAG, "Failed to create WiFi event group");
+                continue;
+            }
+
+            clear_active_profile();
+            g_wifi_should_autoconnect = true;
+            g_wifi_retry_limit = 5;
+            s_retry_num = 0;
+
+            if (!wifi_connect_profile(&profile, profile_index)) {
+                vEventGroupDelete(wifi_event_group);
+                wifi_event_group = NULL;
+                continue;
+            }
+
+            EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                                   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                                   pdTRUE,
+                                                   pdFALSE,
+                                                   pdMS_TO_TICKS(15000));
+
+            if ((bits & WIFI_CONNECTED_BIT) == 0) {
+                ESP_LOGW(TAG, "Failed to connect to SSID: %s", profile.ssid);
+                g_wifi_should_autoconnect = false;
+                ESP_ERROR_CHECK(esp_wifi_disconnect());
+                vEventGroupDelete(wifi_event_group);
+                wifi_event_group = NULL;
+                continue;
+            }
+
+            clear_loaded_model_runtime("profile_validation", false);
+            if (!connect_mqtt_for_active_profile()) {
+                ESP_LOGW(TAG, "MQTT/model validation failed for profile %s", profile.name);
+                g_wifi_should_autoconnect = false;
+                ESP_ERROR_CHECK(esp_wifi_disconnect());
+                clear_active_profile();
+                vEventGroupDelete(wifi_event_group);
+                wifi_event_group = NULL;
+                continue;
+            }
+
+            ESP_LOGI(TAG, "Connected to AP: %s", profile.ssid);
+            connected = true;
+            break;
+        }
+
+        if (!connected) {
+            ESP_LOGW(TAG, "No usable network profile found; retrying scan");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     }
-    vEventGroupDelete(wifi_event_group);
+
+    if (wifi_event_group != NULL) {
+        vEventGroupDelete(wifi_event_group);
+        wifi_event_group = NULL;
+    }
 
     esp_wifi_set_promiscuous(true);
 
@@ -2953,20 +3487,4 @@ extern "C" void app_main(void)
     reset_state_machine();
 
     wifi_init_sta();
-
-    esp_mqtt_client_config_t mqtt_cfg = {};
-    mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
-    mqtt_cfg.session.keepalive = 30;  // reduce timeout for quicker LWT-based detection
-    mqtt_cfg.session.last_will.topic = ESP32_DEVICE_STATUS_TOPIC;
-    mqtt_cfg.session.last_will.msg = "offline";
-    mqtt_cfg.session.last_will.msg_len = 7;
-    mqtt_cfg.session.last_will.qos = 1;
-    mqtt_cfg.session.last_will.retain = 1;
-
-    esp_mqtt_client_handle_t client_handle = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(client_handle,
-                                   (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
-                                   mqtt_event_handler,
-                                   NULL);
-    esp_mqtt_client_start(client_handle);
 }
